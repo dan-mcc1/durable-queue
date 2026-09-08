@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: durable_queue_dev
+      POSTGRES_USER: durable_queue
+      POSTGRES_PASSWORD: durable_queue
+    ports:
+      - "5432:5432"
+    volumes:
+      - durable_queue_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U durable_queue -d durable_queue_dev"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  durable_queue_pgdata:
