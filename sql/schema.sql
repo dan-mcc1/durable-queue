@@ -63,3 +63,11 @@ CREATE TABLE chunk_results (
     partial_sum bigint NOT NULL,
     PRIMARY KEY (problem_id, chunk_index)
 );
+
+-- Benchmark-only (see scripts/benchmark.py): one row per executed job,
+-- recording how long it waited between being enqueued and running.
+CREATE TABLE bench_samples (
+    id          bigserial        PRIMARY KEY,
+    latency_ms  double precision NOT NULL,
+    recorded_at timestamptz      NOT NULL DEFAULT now()
+);

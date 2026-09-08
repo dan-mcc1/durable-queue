@@ -6,6 +6,10 @@ from psycopg.types.json import Jsonb
 
 DEFAULT_LEASE_SECONDS = 30
 
+# Workers LISTEN on this channel so an enqueue can wake an idle worker
+# immediately instead of it waiting out a poll interval.
+JOB_NOTIFY_CHANNEL = "durable_queue_jobs"
+
 
 def enqueue(
         conn: psycopg.Connection,
@@ -33,6 +37,13 @@ def enqueue(
             (task, Jsonb(args), idempotency_key),
         )
         new_id = cur.fetchone()["id"]
+
+        # Deliberately inside the caller's transaction: Postgres only
+        # delivers a NOTIFY when that transaction commits, so a job
+        # enqueued in a transaction that rolls back never wakes anyone.
+        # Identical notifications within one transaction are collapsed,
+        # so a bulk fan-out costs one wakeup, not one per job.
+        cur.execute("SELECT pg_notify(%s, '')", (JOB_NOTIFY_CHANNEL,))
     return new_id
 
 
@@ -129,14 +140,12 @@ def reap_expired_jobs(conn: psycopg.Connection) -> int:
     return dead_lettered + recovered
 
 
-def mark_succeeded(conn: psycopg.Connection, job_id: int, worker_id: str) -> bool:
+def mark_succeeded_in_transaction(conn: psycopg.Connection, job_id: int, worker_id: str) -> bool:
     """
-    Mark a job succeeded, but only if this worker still owns its lease.
-
-    Guarded by locked_by for the same reason extend_lease is: a worker
-    that lost the job (its lease lapsed and someone else reclaimed it)
-    must not write a terminal status over the new owner's in-flight
-    work. Returns whether this worker still held the job.
+    The mark_succeeded UPDATE without the commit, for a caller running
+    it inside its own transaction - specifically a transactional task,
+    whose writes have to land in the same commit as the job's
+    completion. Returns whether this worker still held the job.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -146,7 +155,19 @@ def mark_succeeded(conn: psycopg.Connection, job_id: int, worker_id: str) -> boo
             """,
             (job_id, worker_id),
         )
-        still_owned = cur.rowcount > 0
+        return cur.rowcount > 0
+
+
+def mark_succeeded(conn: psycopg.Connection, job_id: int, worker_id: str) -> bool:
+    """
+    Mark a job succeeded, but only if this worker still owns its lease.
+
+    Guarded by locked_by for the same reason extend_lease is: a worker
+    that lost the job (its lease lapsed and someone else reclaimed it)
+    must not write a terminal status over the new owner's in-flight
+    work. Returns whether this worker still held the job.
+    """
+    still_owned = mark_succeeded_in_transaction(conn, job_id, worker_id)
     conn.commit()
     return still_owned
 

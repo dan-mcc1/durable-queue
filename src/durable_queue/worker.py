@@ -9,16 +9,50 @@ import psycopg
 from durable_queue.db import get_connection
 from durable_queue.jobs import (
     DEFAULT_LEASE_SECONDS,
+    JOB_NOTIFY_CHANNEL,
     claim_next_job,
     extend_lease,
     mark_failed,
     mark_succeeded,
+    mark_succeeded_in_transaction,
     reap_expired_jobs,
 )
-from durable_queue.registry import get_task
+from durable_queue.registry import get_registered_task
 
 
 DEFAULT_MAX_EXECUTION_SECONDS = 300
+
+
+class _LeaseLost(Exception):
+    """
+    Raised to abort a transactional task whose lease lapsed mid-run.
+
+    Raising inside the transaction rolls the task's own writes back,
+    which is the point: if another worker has already reclaimed this
+    job, our work must be discarded rather than committed alongside
+    theirs.
+    """
+
+
+def listen_for_jobs(conn: psycopg.Connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute(f"LISTEN {JOB_NOTIFY_CHANNEL}")
+    conn.commit()
+
+
+def wait_for_job(conn: psycopg.Connection, timeout: float) -> bool:
+    """
+    Block until an enqueue notification arrives or timeout elapses.
+    Returns whether a notification woke us.
+
+    The timeout is what keeps this correct rather than merely fast:
+    retries and scheduled jobs become claimable through the passage of
+    time, with no NOTIFY to announce them, so polling remains the
+    backstop. NOTIFY only removes the latency on the common path.
+    """
+    for _ in conn.notifies(timeout=timeout, stop_after=1):
+        return True
+    return False
 
 
 def generate_worker_id() -> str:
@@ -54,13 +88,19 @@ def process_one(
         conn: psycopg.Connection,
         worker_id: str,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
-        max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS) -> bool:
+        max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS,
+        heartbeat_conn: psycopg.Connection | None = None) -> bool:
     """
     Reap any expired leases, then claim and run a single job, if one is
     available.
 
     Returns True if a job was claimed (regardless of success/failure),
     False if the queue was empty.
+
+    Pass heartbeat_conn to reuse one connection across jobs. Opening a
+    fresh one costs ~13ms against a local database - more than half the
+    per-job budget at this scale - and a worker runs jobs serially, so
+    there's no reason to pay it per job.
     """
     reap_expired_jobs(conn)
 
@@ -72,7 +112,9 @@ def process_one(
     # since the task call below blocks the main thread for as long as
     # the task runs, and a psycopg connection isn't safe to use from
     # more than one thread at a time.
-    heartbeat_conn = get_connection()
+    owns_heartbeat_conn = heartbeat_conn is None
+    if owns_heartbeat_conn:
+        heartbeat_conn = get_connection()
     stop_heartbeat = threading.Event()
     heartbeat_thread = threading.Thread(
         target=_heartbeat_loop,
@@ -90,16 +132,29 @@ def process_one(
     heartbeat_thread.start()
 
     try:
-        fn = get_task(job["task"])
-        fn(**job["args"])
+        registered = get_registered_task(job["task"])
+        if registered.wants_connection:
+            # Exactly-once, not at-least-once: the task's writes and the
+            # job's completion land in one commit, so a crash can't
+            # leave the work done but unrecorded (or vice versa). This
+            # is the case DESIGN.md's "no clean answer" argument doesn't
+            # cover, because nothing here leaves the database.
+            with conn.transaction():
+                registered.fn(conn=conn, **job["args"])
+                if not mark_succeeded_in_transaction(conn, job["id"], worker_id):
+                    raise _LeaseLost
+        else:
+            registered.fn(**job["args"])
+            mark_succeeded(conn, job["id"], worker_id)
+    except _LeaseLost:
+        pass  # another worker owns it now; their run is the one that counts
     except Exception as exc:
         mark_failed(conn, job["id"], worker_id, str(exc))
-    else:
-        mark_succeeded(conn, job["id"], worker_id)
     finally:
         stop_heartbeat.set()
         heartbeat_thread.join()
-        heartbeat_conn.close()
+        if owns_heartbeat_conn:
+            heartbeat_conn.close()
 
     return True
 
@@ -107,12 +162,25 @@ def process_one(
 def run_worker(
         poll_interval: float = 1.0,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
-        max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS) -> None:
+        max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS,
+        use_notify: bool = True) -> None:
+    """
+    use_notify=False falls back to pure polling. Correctness is
+    identical either way - only idle-to-start latency differs, since
+    polling has to wait out the interval before noticing new work.
+    """
     conn = get_connection()
+    heartbeat_conn = get_connection()
     worker_id = generate_worker_id()
+    if use_notify:
+        listen_for_jobs(conn)
     while True:
-        if not process_one(conn, worker_id, lease_seconds, max_execution_seconds):
-            sleep(poll_interval)
+        if not process_one(
+                conn, worker_id, lease_seconds, max_execution_seconds, heartbeat_conn):
+            if use_notify:
+                wait_for_job(conn, poll_interval)
+            else:
+                sleep(poll_interval)
 
 
 if __name__ == "__main__":

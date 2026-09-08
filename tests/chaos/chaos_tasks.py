@@ -39,3 +39,26 @@ def chaos_task(effect_key: str) -> None:
         record_effect(conn, effect_key)
     finally:
         conn.close()
+
+
+@task
+def transactional_chaos_task(conn, effect_key: str) -> None:
+    """
+    The transactional counterpart to chaos_task, run against the same
+    kills - and note what isn't here. No has_effect check, no
+    record_effect, no ledger at all.
+
+    Declaring `conn` makes the worker run this inside its transaction,
+    so this INSERT commits in the same breath as the job's completion.
+    A kill mid-task rolls the INSERT back and the retry redoes it
+    cleanly; a kill after the commit leaves the job already finished.
+    There is no window where the effect happened but wasn't recorded,
+    which is the entire reason chaos_task needs a ledger and this
+    doesn't.
+    """
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO chaos_observations (effect_key) VALUES (%s)", (effect_key,))
+
+    # Widen the window a kill can land in - here it lands mid
+    # transaction, which is precisely what makes it harmless.
+    time.sleep(random.uniform(0.05, 0.2))
