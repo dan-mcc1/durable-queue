@@ -91,19 +91,22 @@ def process_one(
         max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS,
         heartbeat_conn: psycopg.Connection | None = None) -> bool:
     """
-    Reap any expired leases, then claim and run a single job, if one is
-    available.
+    Claim and run a single job, if one is available.
 
     Returns True if a job was claimed (regardless of success/failure),
     False if the queue was empty.
+
+    Reaping expired leases is deliberately not done here - run_worker
+    sweeps on its own schedule. Doing it per job cost a commit and two
+    UPDATEs for work that only matters once per lease period, and
+    measured as roughly 90% of this library's overhead over raw
+    Postgres.
 
     Pass heartbeat_conn to reuse one connection across jobs. Opening a
     fresh one costs ~13ms against a local database - more than half the
     per-job budget at this scale - and a worker runs jobs serially, so
     there's no reason to pay it per job.
     """
-    reap_expired_jobs(conn)
-
     job = claim_next_job(conn, worker_id, lease_seconds)
     if job is None:
         return False
@@ -163,18 +166,32 @@ def run_worker(
         poll_interval: float = 1.0,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         max_execution_seconds: float = DEFAULT_MAX_EXECUTION_SECONDS,
-        use_notify: bool = True) -> None:
+        use_notify: bool = True,
+        reap_interval: float | None = None) -> None:
     """
     use_notify=False falls back to pure polling. Correctness is
     identical either way - only idle-to-start latency differs, since
     polling has to wait out the interval before noticing new work.
+
+    reap_interval defaults to a quarter of the lease, which is often
+    enough to matter and rare enough to be free: an expired lease is
+    only recoverable once it has actually expired, so sweeping far more
+    frequently than the lease period buys nothing.
     """
     conn = get_connection()
     heartbeat_conn = get_connection()
     worker_id = generate_worker_id()
     if use_notify:
         listen_for_jobs(conn)
+    if reap_interval is None:
+        reap_interval = max(1.0, lease_seconds / 4)
+
+    next_reap_at = 0.0  # sweep immediately on startup
     while True:
+        if monotonic() >= next_reap_at:
+            reap_expired_jobs(conn)
+            next_reap_at = monotonic() + reap_interval
+
         if not process_one(
                 conn, worker_id, lease_seconds, max_execution_seconds, heartbeat_conn):
             if use_notify:

@@ -21,6 +21,8 @@ import subprocess
 import sys
 import time
 
+from urllib.parse import quote
+
 import psycopg
 from psycopg.rows import dict_row
 
@@ -212,19 +214,65 @@ def measure_single_process_library(conn, *, job_count: int) -> float:
     return job_count / elapsed
 
 
-def _relaxed_dsn() -> str:
+def _dsn_with(**settings: str) -> str:
     """
-    The same database, but with synchronous_commit=off applied per
-    connection rather than via ALTER DATABASE. Nothing global changes,
-    so there's no shared state to leak into the test suite and nothing
-    to reset if this process dies partway through.
+    The same database with per-connection settings applied through the
+    DSN rather than ALTER DATABASE. Nothing global changes, so there's
+    no shared state to leak into the test suite and nothing to reset if
+    this process dies partway through.
     """
     base = os.environ.get(
         "DATABASE_URL",
         "postgres://durable_queue:durable_queue@localhost:5432/durable_queue_dev",
     )
+    options = quote(" ".join(f"-c {key}={value}" for key, value in settings.items()), safe="")
     separator = "&" if "?" in base else "?"
-    return f"{base}{separator}options=-c%20synchronous_commit%3Doff"
+    return f"{base}{separator}options={options}"
+
+
+def _relaxed_dsn() -> str:
+    return _dsn_with(synchronous_commit="off")
+
+
+def _measure_with_dsn(dsn: str, *, job_count: int, worker_count: int,
+                      poll_interval: float) -> float:
+    tuned_conn = psycopg.connect(dsn, row_factory=dict_row)
+    try:
+        return measure_throughput(
+            tuned_conn, job_count=job_count, worker_count=worker_count,
+            poll_interval=poll_interval, dsn=dsn,
+        )
+    finally:
+        tuned_conn.close()
+
+
+def run_commit_delay_suite(conn, *, job_count: int, worker_count: int,
+                           poll_interval: float) -> None:
+    """
+    commit_delay makes a committing backend pause briefly so other
+    concurrent commits can join the same flush. Unlike
+    synchronous_commit=off it gives up no durability at all - every
+    commit is still fsynced - it just amortises the fsync across
+    several transactions, which is only possible because several
+    workers are committing at once.
+    """
+    print()
+    print("  commit_delay    jobs/sec   change")
+    baseline = None
+    for delay_us in (0, 500, 1000, 2000):
+        if delay_us == 0:
+            rate = measure_throughput(
+                conn, job_count=job_count, worker_count=worker_count,
+                poll_interval=poll_interval,
+            )
+            baseline = rate
+        else:
+            rate = _measure_with_dsn(
+                _dsn_with(commit_delay=str(delay_us), commit_siblings="2"),
+                job_count=job_count, worker_count=worker_count, poll_interval=poll_interval,
+            )
+        change = (rate / baseline - 1) * 100
+        print(f"  {delay_us:>10}us   {rate:>8.0f}   {change:>+6.0f}%")
 
 
 def run_baseline_suite(conn, *, job_count: int) -> None:
@@ -263,15 +311,10 @@ def run_durability_suite(conn, *, job_count: int, worker_count: int, poll_interv
     # queue sits by default - the apples-to-apples setting for any
     # cross-system comparison.
     print("  ... synchronous_commit = off", flush=True)
-    dsn = _relaxed_dsn()
-    relaxed_conn = psycopg.connect(dsn, row_factory=dict_row)
-    try:
-        relaxed = measure_throughput(
-            relaxed_conn, job_count=job_count, worker_count=worker_count,
-            poll_interval=poll_interval, dsn=dsn,
-        )
-    finally:
-        relaxed_conn.close()
+    relaxed = _measure_with_dsn(
+        _relaxed_dsn(), job_count=job_count, worker_count=worker_count,
+        poll_interval=poll_interval,
+    )
 
     print()
     print(f"  synchronous_commit = on       {durable:>8.0f} jobs/sec   (every commit fsynced)")
@@ -289,7 +332,7 @@ def main() -> None:
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument(
         "--suite",
-        choices=("main", "baseline", "scaling", "durability", "all"),
+        choices=("main", "baseline", "scaling", "durability", "commitdelay", "all"),
         default="main",
     )
     args = parser.parse_args()
@@ -312,6 +355,12 @@ def main() -> None:
             if args.suite in ("durability", "all"):
                 print("durability: synchronous_commit on vs off...")
                 run_durability_suite(
+                    conn, job_count=args.jobs, worker_count=args.workers,
+                    poll_interval=args.poll_interval,
+                )
+            if args.suite in ("commitdelay", "all"):
+                print("commit_delay: group-commit tuning, durability unchanged...")
+                run_commit_delay_suite(
                     conn, job_count=args.jobs, worker_count=args.workers,
                     poll_interval=args.poll_interval,
                 )

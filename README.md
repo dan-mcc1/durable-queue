@@ -54,56 +54,86 @@ subprocesses mid-job, at random, with no cleanup opportunity:
 
 ## Benchmarks
 
-All against local Postgres in Docker. `python scripts/benchmark.py [--suite baseline|scaling|durability|all]`
+All against local Postgres in Docker. `python scripts/benchmark.py [--suite baseline|scaling|durability|commitdelay|all]`
 
 **Throughput and latency** (4 workers):
 
 ```
-  throughput                   386 jobs/sec
+  throughput                   489 jobs/sec
 
   enqueue -> start       LISTEN/NOTIFY      polling only
-  p50                        9.5 ms           717.7 ms
-  p99                       13.0 ms           813.1 ms
+  p50                        8.0 ms           717.1 ms
+  p99                        9.3 ms           810.2 ms
 ```
 
 **How much of that is the library?** Same claim/work/complete cycle, single
 process, with and without durable-queue in the path:
 
 ```
-  raw Postgres claim/complete        158 jobs/sec
-  durable-queue                      122 jobs/sec
-  library overhead                    23%
+  raw Postgres claim/complete        156 jobs/sec
+  durable-queue                      154 jobs/sec
+  library overhead                     1%
 ```
 
 **Does `SKIP LOCKED` actually scale?** Worker count vs. throughput:
 
 | workers | jobs/sec | vs 1 worker | efficiency |
 |---|---|---|---|
-| 1 | 121 | 1.00x | 100% |
-| 2 | 221 | 1.82x | 91% |
-| 4 | 386 | 3.19x | 80% |
-| 8 | 700 | 5.78x | 72% |
+| 1 | 148 | 1.00x | 100% |
+| 2 | 276 | 1.86x | 93% |
+| 4 | 487 | 3.28x | 82% |
+| 8 | 800 | 5.39x | 67% |
 
 **What does durability cost?** The same run with fsync-per-commit relaxed to
 roughly where a Redis-backed queue sits by default:
 
 ```
-  synchronous_commit = on            386 jobs/sec   (every commit fsynced)
-  synchronous_commit = off           711 jobs/sec   (commits may be lost on crash)
-  cost of durability                  46%
+  synchronous_commit = on            487 jobs/sec   (every commit fsynced)
+  synchronous_commit = off          1017 jobs/sec   (commits may be lost on crash)
+  cost of durability                  52%
 ```
 
 That last number is the honest frame for any comparison against a Redis-backed
-queue: roughly half this queue's throughput is spent being durable. A system
-that doesn't fsync will win the benchmark, and that's what it's buying with the
-win.
+queue: about half this queue's throughput is spent being durable. A system that
+doesn't fsync will win the benchmark, and that's what it's buying with the win.
 
-The harness earned its keep twice. Its first run showed 162 jobs/sec and a 35ms
-p50 — profiling the loop found `process_one` opening a fresh heartbeat
-connection per job (~13ms locally, over half the per-job budget), and reusing
-one per worker took it to 386/sec and 9.5ms. Its second finding was a bug in
-the harness itself: a `SELECT` that never committed held a read lock on `jobs`
-and deadlocked the next phase's `TRUNCATE`.
+**What didn't work:** `commit_delay` (group commit) was expected to recover some
+of that durability cost for free, since it batches fsyncs across concurrent
+transactions without giving up any durability. Measured, it doesn't:
+
+| commit_delay | 4 workers | 8 workers |
+|---|---|---|
+| 0µs | baseline | baseline |
+| 500µs | +0% | +0% |
+| 1000µs | −11% | +0% |
+| 2000µs | −28% | −17% |
+
+The reason it can't help is the same one that makes the queue fast: each worker
+runs claim → work → complete serially, so there are rarely enough simultaneous
+commits in flight for group commit to batch. The workload is bound by
+round-trip latency, not fsync bandwidth, and `commit_delay` trades exactly the
+former for the latter.
+
+### What the harness found
+
+Three times the benchmark paid for itself:
+
+1. **162 → 386 jobs/sec.** The first run was slower than it should have been;
+   profiling found `process_one` opening a fresh heartbeat connection per job
+   (~13ms locally, over half the per-job budget). Reused one per worker.
+2. **23% → 1% overhead.** The remaining gap against raw Postgres was almost
+   entirely the reaper sweep running before *every job* — a commit and two
+   `UPDATE`s for work that only matters once per lease period. Throttling it to
+   a quarter of the lease closed the gap and lifted every configuration 14–27%.
+3. **A bug in the harness itself** — a `SELECT` that never committed held a read
+   lock on `jobs` and deadlocked the next phase's `TRUNCATE`. Each phase passed
+   alone; only the sequence hung.
+
+One caveat on the absolute figures: this is Docker Desktop on Windows, where
+fsync goes through a virtualised filesystem and is unusually slow. The relative
+measurements — overhead, scaling efficiency, durability cost — are the ones
+worth quoting. The 8-worker runs also drain in under a second at these job
+counts, so that row is the least precise.
 
 ## Running it
 
