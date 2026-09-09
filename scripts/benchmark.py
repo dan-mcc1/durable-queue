@@ -16,14 +16,18 @@ Run it:  python scripts/benchmark.py
 Requires Postgres up and the schema applied (see README).
 """
 import argparse
+import os
 import subprocess
 import sys
 import time
 
+import psycopg
+from psycopg.rows import dict_row
+
 from durable_queue.db import get_connection
 from durable_queue.jobs import enqueue
 from durable_queue.registry import task
-from durable_queue.worker import run_worker
+from durable_queue.worker import generate_worker_id, process_one, run_worker
 
 WORKER_SETTLE_SECONDS = 1.5
 
@@ -47,12 +51,16 @@ def _reset(conn) -> None:
     conn.commit()
 
 
-def _spawn_workers(count: int, *, use_notify: bool, poll_interval: float) -> list:
+def _spawn_workers(count: int, *, use_notify: bool, poll_interval: float,
+                   dsn: str | None = None) -> list:
     argv = [sys.executable, __file__, "--worker", "--poll-interval", str(poll_interval)]
     if not use_notify:
         argv.append("--no-notify")
+    env = None
+    if dsn is not None:
+        env = {**os.environ, "DATABASE_URL": dsn}
     workers = [
-        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(count)
     ]
     time.sleep(WORKER_SETTLE_SECONDS)  # don't bill process startup to the queue
@@ -69,7 +77,13 @@ def _stop(workers: list) -> None:
 def _pending_count(conn) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) AS n FROM jobs WHERE status NOT IN ('succeeded', 'dead')")
-        return cur.fetchone()["n"]
+        count = cur.fetchone()["n"]
+    # Ending the transaction matters more than it looks: a bare SELECT
+    # still opens one, and leaving it open holds an ACCESS SHARE lock on
+    # jobs, which blocks the next phase's TRUNCATE indefinitely. Each
+    # phase works in isolation; only the sequence deadlocks.
+    conn.commit()
+    return count
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -78,19 +92,33 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[index]
 
 
-def measure_throughput(conn, *, job_count: int, worker_count: int, poll_interval: float) -> float:
+def _drain(conn, *, timeout_seconds: float = 120.0) -> float:
+    """Wait for the queue to empty, returning elapsed seconds."""
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    while True:
+        remaining = _pending_count(conn)
+        if remaining == 0:
+            return time.monotonic() - started
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"queue did not drain within {timeout_seconds}s; {remaining} jobs left"
+            )
+        time.sleep(0.05)
+
+
+def measure_throughput(conn, *, job_count: int, worker_count: int, poll_interval: float,
+                       dsn: str | None = None) -> float:
     _reset(conn)
-    workers = _spawn_workers(worker_count, use_notify=True, poll_interval=poll_interval)
+    workers = _spawn_workers(
+        worker_count, use_notify=True, poll_interval=poll_interval, dsn=dsn
+    )
     try:
         now = time.time()
         for _ in range(job_count):
             enqueue(conn, "bench_job", {"enqueued_at": now})
         conn.commit()
-
-        started = time.monotonic()
-        while _pending_count(conn) > 0:
-            time.sleep(0.05)
-        elapsed = time.monotonic() - started
+        elapsed = _drain(conn)
     finally:
         _stop(workers)
     return job_count / elapsed
@@ -108,15 +136,147 @@ def measure_latency(conn, *, samples: int, worker_count: int, poll_interval: flo
             conn.commit()
             time.sleep(poll_interval * 1.5)
 
-        deadline = time.monotonic() + 30
-        while _pending_count(conn) > 0 and time.monotonic() < deadline:
-            time.sleep(0.05)
+        _drain(conn, timeout_seconds=30.0)
 
         with conn.cursor() as cur:
             cur.execute("SELECT latency_ms FROM bench_samples")
             return [row["latency_ms"] for row in cur.fetchall()]
     finally:
         _stop(workers)
+
+
+def measure_raw_ceiling(conn, *, job_count: int) -> float:
+    """
+    The same claim/work/complete cycle with no library in the path: what
+    Postgres itself can sustain, single process. The gap against
+    measure_single_process_library is durable-queue's overhead - leases,
+    the reaper sweep, registry dispatch, the heartbeat thread.
+    """
+    _reset(conn)
+    with conn.cursor() as cur:
+        for _ in range(job_count):
+            cur.execute("INSERT INTO jobs (task, args) VALUES ('raw', '{}')")
+    conn.commit()
+
+    started = time.monotonic()
+    processed = 0
+    while True:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs SET status = 'running', locked_by = 'raw'
+                WHERE id = (
+                    SELECT id FROM jobs
+                    WHERE status = 'pending' AND run_at <= now()
+                    ORDER BY run_at, id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                RETURNING id
+                """
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if row is None:
+            break
+
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO bench_samples (latency_ms) VALUES (0)")
+            cur.execute(
+                "UPDATE jobs SET status = 'succeeded', finished_at = now() WHERE id = %s",
+                (row["id"],),
+            )
+        conn.commit()
+        processed += 1
+
+    return processed / (time.monotonic() - started)
+
+
+def measure_single_process_library(conn, *, job_count: int) -> float:
+    """durable-queue draining the same queue, one process, no subprocess noise."""
+    _reset(conn)
+    now = time.time()
+    for _ in range(job_count):
+        enqueue(conn, "bench_job", {"enqueued_at": now})
+    conn.commit()
+
+    heartbeat_conn = get_connection()
+    worker_id = generate_worker_id()
+    try:
+        started = time.monotonic()
+        while process_one(conn, worker_id, heartbeat_conn=heartbeat_conn):
+            pass
+        elapsed = time.monotonic() - started
+    finally:
+        heartbeat_conn.close()
+    return job_count / elapsed
+
+
+def _relaxed_dsn() -> str:
+    """
+    The same database, but with synchronous_commit=off applied per
+    connection rather than via ALTER DATABASE. Nothing global changes,
+    so there's no shared state to leak into the test suite and nothing
+    to reset if this process dies partway through.
+    """
+    base = os.environ.get(
+        "DATABASE_URL",
+        "postgres://durable_queue:durable_queue@localhost:5432/durable_queue_dev",
+    )
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}options=-c%20synchronous_commit%3Doff"
+
+
+def run_baseline_suite(conn, *, job_count: int) -> None:
+    raw = measure_raw_ceiling(conn, job_count=job_count)
+    library = measure_single_process_library(conn, job_count=job_count)
+    overhead = (1 - library / raw) * 100
+
+    print()
+    print("  single process, same workload")
+    print(f"  raw Postgres claim/complete   {raw:>8.0f} jobs/sec")
+    print(f"  durable-queue                 {library:>8.0f} jobs/sec")
+    print(f"  library overhead              {overhead:>8.0f}%")
+
+
+def run_scaling_suite(conn, *, job_count: int, poll_interval: float) -> None:
+    print()
+    print("  workers   jobs/sec   vs 1 worker   efficiency")
+    single = None
+    for workers in (1, 2, 4, 8):
+        rate = measure_throughput(
+            conn, job_count=job_count, worker_count=workers, poll_interval=poll_interval
+        )
+        if single is None:
+            single = rate
+        speedup = rate / single
+        print(f"  {workers:>7}   {rate:>8.0f}   {speedup:>10.2f}x   {speedup / workers * 100:>9.0f}%")
+
+
+def run_durability_suite(conn, *, job_count: int, worker_count: int, poll_interval: float) -> None:
+    print("  ... synchronous_commit = on", flush=True)
+    durable = measure_throughput(
+        conn, job_count=job_count, worker_count=worker_count, poll_interval=poll_interval
+    )
+
+    # Relaxing fsync-per-commit puts Postgres roughly where a Redis-backed
+    # queue sits by default - the apples-to-apples setting for any
+    # cross-system comparison.
+    print("  ... synchronous_commit = off", flush=True)
+    dsn = _relaxed_dsn()
+    relaxed_conn = psycopg.connect(dsn, row_factory=dict_row)
+    try:
+        relaxed = measure_throughput(
+            relaxed_conn, job_count=job_count, worker_count=worker_count,
+            poll_interval=poll_interval, dsn=dsn,
+        )
+    finally:
+        relaxed_conn.close()
+
+    print()
+    print(f"  synchronous_commit = on       {durable:>8.0f} jobs/sec   (every commit fsynced)")
+    print(f"  synchronous_commit = off      {relaxed:>8.0f} jobs/sec   (commits may be lost on crash)")
+    print(f"  cost of durability            {(1 - durable / relaxed) * 100:>8.0f}%")
 
 
 def main() -> None:
@@ -127,10 +287,36 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--latency-samples", type=int, default=15)
     parser.add_argument("--poll-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--suite",
+        choices=("main", "baseline", "scaling", "durability", "all"),
+        default="main",
+    )
     args = parser.parse_args()
 
     if args.worker:
         run_worker(poll_interval=args.poll_interval, use_notify=not args.no_notify)
+        return
+
+    if args.suite != "main":
+        conn = get_connection()
+        try:
+            if args.suite in ("baseline", "all"):
+                print("baseline: raw Postgres vs durable-queue, single process...")
+                run_baseline_suite(conn, job_count=max(args.jobs // 2, 100))
+            if args.suite in ("scaling", "all"):
+                print("scaling: 1/2/4/8 workers...")
+                run_scaling_suite(
+                    conn, job_count=args.jobs, poll_interval=args.poll_interval
+                )
+            if args.suite in ("durability", "all"):
+                print("durability: synchronous_commit on vs off...")
+                run_durability_suite(
+                    conn, job_count=args.jobs, worker_count=args.workers,
+                    poll_interval=args.poll_interval,
+                )
+        finally:
+            conn.close()
         return
 
     conn = get_connection()

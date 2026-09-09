@@ -54,21 +54,56 @@ subprocesses mid-job, at random, with no cleanup opportunity:
 
 ## Benchmarks
 
-`python scripts/benchmark.py`, against local Postgres in Docker, 4 workers:
+All against local Postgres in Docker. `python scripts/benchmark.py [--suite baseline|scaling|durability|all]`
+
+**Throughput and latency** (4 workers):
 
 ```
-  throughput                   383 jobs/sec
+  throughput                   386 jobs/sec
 
   enqueue -> start       LISTEN/NOTIFY      polling only
   p50                        9.5 ms           717.7 ms
   p99                       13.0 ms           813.1 ms
 ```
 
-The benchmark earned its keep immediately: the first run showed 162 jobs/sec
-and a 35ms p50, and profiling the loop found `process_one` opening a fresh
-heartbeat connection per job — ~13ms against a local database, over half the
-per-job budget. Reusing one connection per worker took throughput to 383/sec
-and p50 to 9.5ms.
+**How much of that is the library?** Same claim/work/complete cycle, single
+process, with and without durable-queue in the path:
+
+```
+  raw Postgres claim/complete        158 jobs/sec
+  durable-queue                      122 jobs/sec
+  library overhead                    23%
+```
+
+**Does `SKIP LOCKED` actually scale?** Worker count vs. throughput:
+
+| workers | jobs/sec | vs 1 worker | efficiency |
+|---|---|---|---|
+| 1 | 121 | 1.00x | 100% |
+| 2 | 221 | 1.82x | 91% |
+| 4 | 386 | 3.19x | 80% |
+| 8 | 700 | 5.78x | 72% |
+
+**What does durability cost?** The same run with fsync-per-commit relaxed to
+roughly where a Redis-backed queue sits by default:
+
+```
+  synchronous_commit = on            386 jobs/sec   (every commit fsynced)
+  synchronous_commit = off           711 jobs/sec   (commits may be lost on crash)
+  cost of durability                  46%
+```
+
+That last number is the honest frame for any comparison against a Redis-backed
+queue: roughly half this queue's throughput is spent being durable. A system
+that doesn't fsync will win the benchmark, and that's what it's buying with the
+win.
+
+The harness earned its keep twice. Its first run showed 162 jobs/sec and a 35ms
+p50 — profiling the loop found `process_one` opening a fresh heartbeat
+connection per job (~13ms locally, over half the per-job budget), and reusing
+one per worker took it to 386/sec and 9.5ms. Its second finding was a bug in
+the harness itself: a `SELECT` that never committed held a read lock on `jobs`
+and deadlocked the next phase's `TRUNCATE`.
 
 ## Running it
 
