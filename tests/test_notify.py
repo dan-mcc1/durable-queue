@@ -6,7 +6,24 @@ from time import monotonic
 
 from durable_queue.db import get_connection
 from durable_queue.jobs import enqueue
-from durable_queue.worker import listen_for_jobs, wait_for_job
+from durable_queue.worker import (
+    listen_for_jobs,
+    relax_bookkeeping_durability,
+    wait_for_job,
+)
+
+
+def test_relax_bookkeeping_durability_applies_to_that_connection_only(conn):
+    relaxed = get_connection()
+    try:
+        relax_bookkeeping_durability(relaxed)
+
+        assert relaxed.execute("SHOW synchronous_commit").fetchone()["synchronous_commit"] == "off"
+        # Other connections - notably whichever one the application
+        # enqueues through - are untouched and stay durable.
+        assert conn.execute("SHOW synchronous_commit").fetchone()["synchronous_commit"] == "on"
+    finally:
+        relaxed.close()
 
 
 def test_wait_for_job_times_out_when_nothing_is_enqueued(conn):

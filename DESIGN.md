@@ -252,8 +252,4 @@ system — stopping early still means stopping with something real.
 ### Stretch — cut without guilt
 
 - **M11 · Durable workflows** (3+ evenings) — `workflow_steps` memoization
-  so a multi-step job resumes at step 3 instead of restarting. Explicitly
-  optional; M1–M10 is a complete, defensible project.
-
-If running long: cut M11 first, then trim M7 to a single stats command. Do
-not cut M8 or M10 — they're the two that make this more than a tutorial.
+  so a multi-step job resumes at step 3 instead of restarting.

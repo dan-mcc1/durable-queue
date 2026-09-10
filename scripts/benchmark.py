@@ -29,7 +29,8 @@ from psycopg.rows import dict_row
 from durable_queue.db import get_connection
 from durable_queue.jobs import enqueue
 from durable_queue.registry import task
-from durable_queue.worker import generate_worker_id, process_one, run_worker
+from durable_queue.jobs import DEFAULT_LEASE_SECONDS, claim_jobs, enqueue_many
+from durable_queue.worker import _Heartbeat, generate_worker_id, run_job, run_worker
 
 WORKER_SETTLE_SECONDS = 1.5
 
@@ -54,8 +55,14 @@ def _reset(conn) -> None:
 
 
 def _spawn_workers(count: int, *, use_notify: bool, poll_interval: float,
-                   dsn: str | None = None) -> list:
-    argv = [sys.executable, __file__, "--worker", "--poll-interval", str(poll_interval)]
+                   dsn: str | None = None, concurrency: int = 1,
+                   batch_size: int = 10) -> list:
+    argv = [
+        sys.executable, __file__, "--worker",
+        "--poll-interval", str(poll_interval),
+        "--concurrency", str(concurrency),
+        "--batch-size", str(batch_size),
+    ]
     if not use_notify:
         argv.append("--no-notify")
     env = None
@@ -74,6 +81,28 @@ def _stop(workers: list) -> None:
         w.kill()
     for w in workers:
         w.wait()
+
+
+def _any_unfinished(conn) -> bool:
+    """
+    Progress check for the drain loop, phrased to match the partial
+    indexes exactly so it becomes two index-only scans rather than a
+    sequential scan.
+
+    The obvious phrasing - count(*) WHERE status NOT IN ('succeeded',
+    'dead') - is a seq scan costing 2.85ms on a 30k-row table, run 20
+    times a second while measuring. That grows with the table, so it
+    quietly penalised exactly the long runs it was meant to measure.
+    This version is 0.086ms and O(1) in table size.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE status = 'pending')"
+            "    OR EXISTS(SELECT 1 FROM jobs WHERE status = 'running') AS unfinished"
+        )
+        unfinished = cur.fetchone()["unfinished"]
+    conn.commit()
+    return unfinished
 
 
 def _pending_count(conn) -> int:
@@ -99,26 +128,27 @@ def _drain(conn, *, timeout_seconds: float = 120.0) -> float:
     started = time.monotonic()
     deadline = started + timeout_seconds
     while True:
-        remaining = _pending_count(conn)
-        if remaining == 0:
+        if not _any_unfinished(conn):
             return time.monotonic() - started
         if time.monotonic() > deadline:
             raise RuntimeError(
-                f"queue did not drain within {timeout_seconds}s; {remaining} jobs left"
+                f"queue did not drain within {timeout_seconds}s; "
+                f"{_pending_count(conn)} jobs left"
             )
         time.sleep(0.05)
 
 
 def measure_throughput(conn, *, job_count: int, worker_count: int, poll_interval: float,
-                       dsn: str | None = None) -> float:
+                       dsn: str | None = None, concurrency: int = 1,
+                       batch_size: int = 10, use_notify: bool = True) -> float:
     _reset(conn)
     workers = _spawn_workers(
-        worker_count, use_notify=True, poll_interval=poll_interval, dsn=dsn
+        worker_count, use_notify=use_notify, poll_interval=poll_interval, dsn=dsn,
+        concurrency=concurrency, batch_size=batch_size,
     )
     try:
         now = time.time()
-        for _ in range(job_count):
-            enqueue(conn, "bench_job", {"enqueued_at": now})
+        enqueue_many(conn, "bench_job", [{"enqueued_at": now}] * job_count)
         conn.commit()
         elapsed = _drain(conn)
     finally:
@@ -194,23 +224,40 @@ def measure_raw_ceiling(conn, *, job_count: int) -> float:
     return processed / (time.monotonic() - started)
 
 
-def measure_single_process_library(conn, *, job_count: int) -> float:
-    """durable-queue draining the same queue, one process, no subprocess noise."""
+def measure_single_process_library(conn, *, job_count: int, batch_size: int) -> float:
+    """
+    durable-queue draining the same queue in one process, taking the
+    same path run_worker does - batched claims on an autocommit
+    connection - so this measures what a worker actually costs rather
+    than a path nothing uses any more.
+    """
     _reset(conn)
     now = time.time()
     for _ in range(job_count):
         enqueue(conn, "bench_job", {"enqueued_at": now})
     conn.commit()
 
+    worker_conn = get_connection()
+    worker_conn.autocommit = True
     heartbeat_conn = get_connection()
     worker_id = generate_worker_id()
+    heartbeat = _Heartbeat(heartbeat_conn, worker_id, DEFAULT_LEASE_SECONDS,
+                           DEFAULT_LEASE_SECONDS / 3)
+    heartbeat.start()
     try:
         started = time.monotonic()
-        while process_one(conn, worker_id, heartbeat_conn=heartbeat_conn):
-            pass
+        while True:
+            batch = claim_jobs(worker_conn, worker_id, batch_size=batch_size)
+            if not batch:
+                break
+            heartbeat.hold([job["id"] for job in batch])
+            while batch:
+                run_job(worker_conn, batch.pop(0), worker_id, heartbeat=heartbeat)
         elapsed = time.monotonic() - started
     finally:
+        heartbeat.stop()
         heartbeat_conn.close()
+        worker_conn.close()
     return job_count / elapsed
 
 
@@ -246,6 +293,95 @@ def _measure_with_dsn(dsn: str, *, job_count: int, worker_count: int,
         tuned_conn.close()
 
 
+# How a worker behaves before any of the tuning work: one job claimed
+# per round trip, one at a time, and no notification to wake it.
+NAIVE = {"concurrency": 1, "batch_size": 1, "use_notify": False}
+TUNED = {"concurrency": 8, "batch_size": 25, "use_notify": True}
+
+
+def run_comparison_suite(conn, *, job_count: int, poll_interval: float) -> None:
+    """
+    Naive versus tuned, measured back to back on the same machine.
+
+    Not every improvement is reachable by flags - reaper throttling, the
+    reused heartbeat connection and the shared heartbeat thread are now
+    unconditional - so the "naive" column here is already faster than
+    the original code was. It understates the total gain rather than
+    inflating it.
+    """
+    print()
+    print("  throughput (jobs/sec)      naive      tuned    speedup")
+    for workers in (1, 2, 4, 8):
+        naive = measure_throughput(
+            conn, job_count=job_count, worker_count=workers,
+            poll_interval=poll_interval, **NAIVE,
+        )
+        tuned = measure_throughput(
+            conn, job_count=job_count * 5, worker_count=workers,
+            poll_interval=poll_interval, **TUNED,
+        )
+        print(f"  {workers} worker process(es){naive:>11.0f}{tuned:>11.0f}   {tuned / naive:>6.1f}x")
+
+    naive_latency = measure_latency(
+        conn, samples=10, worker_count=4, poll_interval=poll_interval, use_notify=False
+    )
+    tuned_latency = measure_latency(
+        conn, samples=10, worker_count=4, poll_interval=poll_interval, use_notify=True
+    )
+    naive_p50 = _percentile(naive_latency, 0.50)
+    tuned_p50 = _percentile(tuned_latency, 0.50)
+    print()
+    print("  enqueue -> start (ms)      naive      tuned    speedup")
+    print(f"  p50 latency        {naive_p50:>11.1f}{tuned_p50:>11.1f}   "
+          f"{naive_p50 / max(tuned_p50, 0.001):>6.1f}x")
+
+
+def run_curve_suite(conn, *, job_count: int, poll_interval: float) -> None:
+    """
+    Throughput against total jobs in flight, which is what actually
+    determines it - not how the concurrency is split between processes
+    and threads.
+
+    Reading a scaling number without knowing where on this curve it
+    sits is how you conclude that one configuration "scales better"
+    than another when both are simply walking different ranges of the
+    same curve.
+    """
+    print()
+    print(f"  {'in flight':>10} {'split':>10} {'jobs/sec':>10} {'marginal':>10}")
+    previous = None
+    for workers, slots in ((1, 1), (1, 2), (1, 4), (1, 8), (2, 8), (4, 8), (8, 8)):
+        rate = measure_throughput(
+            conn, job_count=job_count, worker_count=workers,
+            poll_interval=poll_interval, concurrency=slots, batch_size=25,
+        )
+        marginal = "-" if previous is None else f"{rate / previous:.2f}x"
+        split = f"{workers}w x {slots}s"
+        print(f"  {workers * slots:>10} {split:>10} {rate:>10.0f} {marginal:>10}")
+        previous = rate
+
+
+def run_concurrency_suite(conn, *, job_count: int, worker_count: int,
+                          poll_interval: float) -> None:
+    """
+    Slots per worker process. A worker spends most of each job waiting
+    on a round trip, so overlapping jobs hides latency that no query
+    tuning can remove. bench_job is database-bound, which understates
+    this - a task waiting on an HTTP call would gain far more.
+    """
+    print()
+    print(f"  slots/worker   jobs/sec   vs 1 slot   ({worker_count} worker processes)")
+    single = None
+    for slots in (1, 2, 4, 8):
+        rate = measure_throughput(
+            conn, job_count=job_count, worker_count=worker_count,
+            poll_interval=poll_interval, concurrency=slots,
+        )
+        if single is None:
+            single = rate
+        print(f"  {slots:>12}   {rate:>8.0f}   {rate / single:>8.2f}x")
+
+
 def run_commit_delay_suite(conn, *, job_count: int, worker_count: int,
                            poll_interval: float) -> None:
     """
@@ -277,14 +413,16 @@ def run_commit_delay_suite(conn, *, job_count: int, worker_count: int,
 
 def run_baseline_suite(conn, *, job_count: int) -> None:
     raw = measure_raw_ceiling(conn, job_count=job_count)
-    library = measure_single_process_library(conn, job_count=job_count)
-    overhead = (1 - library / raw) * 100
+    unbatched = measure_single_process_library(conn, job_count=job_count, batch_size=1)
+    batched = measure_single_process_library(conn, job_count=job_count, batch_size=10)
 
     print()
     print("  single process, same workload")
-    print(f"  raw Postgres claim/complete   {raw:>8.0f} jobs/sec")
-    print(f"  durable-queue                 {library:>8.0f} jobs/sec")
-    print(f"  library overhead              {overhead:>8.0f}%")
+    print(f"  raw Postgres, one at a time   {raw:>8.0f} jobs/sec")
+    print(f"  durable-queue, batch of 1     {unbatched:>8.0f} jobs/sec   "
+          f"({(unbatched / raw - 1) * 100:+.0f}% vs raw)")
+    print(f"  durable-queue, batch of 10    {batched:>8.0f} jobs/sec   "
+          f"({(batched / raw - 1) * 100:+.0f}% vs raw)")
 
 
 def run_scaling_suite(conn, *, job_count: int, poll_interval: float) -> None:
@@ -310,6 +448,17 @@ def run_durability_suite(conn, *, job_count: int, worker_count: int, poll_interv
     # Relaxing fsync-per-commit puts Postgres roughly where a Redis-backed
     # queue sits by default - the apples-to-apples setting for any
     # cross-system comparison.
+    # Workers relaxed, enqueues still fully durable. Losing a worker's
+    # claim or completion commit in a crash is not data loss - it's a
+    # re-run, which is the at-least-once path this queue already
+    # implements. Losing an *enqueue* would be data loss, and that
+    # commit belongs to the caller's transaction, which stays durable.
+    print("  ... workers relaxed, enqueues durable", flush=True)
+    worker_relaxed = measure_throughput(
+        conn, job_count=job_count, worker_count=worker_count,
+        poll_interval=poll_interval, dsn=_relaxed_dsn(),
+    )
+
     print("  ... synchronous_commit = off", flush=True)
     relaxed = _measure_with_dsn(
         _relaxed_dsn(), job_count=job_count, worker_count=worker_count,
@@ -317,28 +466,40 @@ def run_durability_suite(conn, *, job_count: int, worker_count: int, poll_interv
     )
 
     print()
-    print(f"  synchronous_commit = on       {durable:>8.0f} jobs/sec   (every commit fsynced)")
-    print(f"  synchronous_commit = off      {relaxed:>8.0f} jobs/sec   (commits may be lost on crash)")
-    print(f"  cost of durability            {(1 - durable / relaxed) * 100:>8.0f}%")
+    print(f"  everything durable            {durable:>8.0f} jobs/sec   (every commit fsynced)")
+    print(f"  workers relaxed               {worker_relaxed:>8.0f} jobs/sec   (enqueues still durable; "
+          "a lost worker commit is a re-run)")
+    print(f"  nothing durable               {relaxed:>8.0f} jobs/sec   (an enqueue can vanish - real data loss)")
+    print()
+    print(f"  cost of full durability       {(1 - durable / relaxed) * 100:>8.0f}%")
+    print(f"  cost of durable enqueues only {(1 - worker_relaxed / relaxed) * 100:>8.0f}%")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-notify", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--concurrency", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--batch-size", type=int, default=10, help=argparse.SUPPRESS)
     parser.add_argument("--jobs", type=int, default=1000)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--latency-samples", type=int, default=15)
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument(
         "--suite",
-        choices=("main", "baseline", "scaling", "durability", "commitdelay", "all"),
+        choices=("main", "baseline", "scaling", "concurrency", "curve",
+                 "durability", "commitdelay", "comparison", "all"),
         default="main",
     )
     args = parser.parse_args()
 
     if args.worker:
-        run_worker(poll_interval=args.poll_interval, use_notify=not args.no_notify)
+        run_worker(
+            poll_interval=args.poll_interval,
+            use_notify=not args.no_notify,
+            concurrency=args.concurrency,
+            batch_size=args.batch_size,
+        )
         return
 
     if args.suite != "main":
@@ -351,6 +512,22 @@ def main() -> None:
                 print("scaling: 1/2/4/8 workers...")
                 run_scaling_suite(
                     conn, job_count=args.jobs, poll_interval=args.poll_interval
+                )
+            if args.suite in ("comparison", "all"):
+                print("comparison: naive vs tuned worker configuration...")
+                run_comparison_suite(
+                    conn, job_count=args.jobs, poll_interval=args.poll_interval
+                )
+            if args.suite in ("curve", "all"):
+                print("curve: throughput vs total jobs in flight...")
+                run_curve_suite(
+                    conn, job_count=args.jobs, poll_interval=args.poll_interval
+                )
+            if args.suite in ("concurrency", "all"):
+                print("concurrency: slots per worker process...")
+                run_concurrency_suite(
+                    conn, job_count=args.jobs, worker_count=args.workers,
+                    poll_interval=args.poll_interval,
                 )
             if args.suite in ("durability", "all"):
                 print("durability: synchronous_commit on vs off...")

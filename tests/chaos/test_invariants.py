@@ -108,7 +108,21 @@ def test_no_job_lost_or_duplicated_when_workers_are_killed_mid_job(conn):
     missing = [k for k in effect_keys if observation_counts.get(k, 0) == 0]
     duplicated = [k for k, n in observation_counts.items() if n > 1]
 
-    assert not missing, f"effects never observed despite the job succeeding: {missing}"
+    # If effects go missing, the first thing worth knowing is whether
+    # chaos_task skipped them because the ledger already claimed they
+    # were done - which would point at leaked state rather than at lost
+    # work. Cheap to collect, and it turns a mystified rerun into an
+    # answer.
+    if missing:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) AS n FROM effects")
+            ledger_rows = cur.fetchone()["n"]
+        raise AssertionError(
+            f"effects never observed despite the job succeeding: {missing}\n"
+            f"effects ledger holds {ledger_rows} rows; if that covers the missing "
+            f"keys, has_effect() short-circuited them and the ledger was polluted "
+            f"before the run rather than the work being lost"
+        )
     print(
         f"\nchaos result: {len(duplicated)}/{job_count} effects duplicated "
         f"(expected: small but possibly nonzero - the narrow at-least-once window)"

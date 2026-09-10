@@ -31,6 +31,27 @@ def test_show_reports_missing_job_with_nonzero_exit(conn):
     assert "No job with id 999999" in result.stdout
 
 
+def test_purge_deletes_only_jobs_past_the_retention_window(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO jobs (task, status, finished_at)"
+            " VALUES ('t', 'succeeded', now() - interval '2 days')"
+        )
+        cur.execute(
+            "INSERT INTO jobs (task, status, finished_at)"
+            " VALUES ('t', 'succeeded', now() - interval '1 minute')"
+        )
+    conn.commit()
+
+    result = runner.invoke(app, ["purge", "--older-than-hours", "24"])
+
+    assert result.exit_code == 0
+    assert "Deleted 1 completed job(s)" in result.stdout
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM jobs")
+        assert cur.fetchone()["n"] == 1
+
+
 def test_retry_reports_failure_for_a_non_dead_job(conn):
     job_id = enqueue(conn, "some_task", {})
     conn.commit()

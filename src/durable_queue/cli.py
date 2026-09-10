@@ -1,7 +1,13 @@
 import typer
 
 from durable_queue.db import get_connection
-from durable_queue.jobs import get_job, get_queue_stats, list_jobs, retry_job
+from durable_queue.jobs import (
+    delete_completed_jobs,
+    get_job,
+    get_queue_stats,
+    list_jobs,
+    retry_job,
+)
 
 app = typer.Typer()
 
@@ -71,6 +77,26 @@ def dead(limit: int = typer.Option(20, help="Max rows to show")) -> None:
             f"{job['id']:>6}  {job['task']:<30} attempts={job['attempts']} "
             f"last_error={job['last_error']}"
         )
+
+
+@app.command()
+def purge(older_than_hours: float = typer.Option(24.0, help="Retain jobs finished within this window"),
+          batch: int = typer.Option(1000, help="Rows to delete per statement")) -> None:
+    """
+    Delete completed jobs past the retention window.
+
+    Reclaims storage and reduces autovacuum load; it does not speed up
+    claiming, since the claim's partial index only ever contained pending
+    rows. Note the window must outlast any period you rely on
+    enqueue-time idempotency over, because deleting a row frees its
+    idempotency key for reuse.
+    """
+    conn = get_connection()
+    try:
+        deleted = delete_completed_jobs(conn, older_than_hours * 3600, batch=batch)
+    finally:
+        conn.close()
+    typer.echo(f"Deleted {deleted} completed job(s) finished more than {older_than_hours}h ago.")
 
 
 @app.command()
