@@ -4,11 +4,11 @@ writing terminal status over a job it no longer owns, a hung task
 holding its lease forever, a job that repeatedly kills its worker
 retrying forever, and claim_next_job leaving an open transaction.
 """
-import threading
-from time import monotonic
+from time import sleep
 
 from durable_queue.db import get_connection
 from durable_queue.jobs import (
+    claim_jobs,
     claim_next_job,
     enqueue,
     get_job,
@@ -16,7 +16,7 @@ from durable_queue.jobs import (
     mark_succeeded,
     reap_expired_jobs,
 )
-from durable_queue.worker import _heartbeat_loop
+from durable_queue.worker import _Heartbeat
 
 
 def test_claim_next_job_does_not_leave_an_open_transaction(conn, worker_id):
@@ -66,23 +66,35 @@ def test_mark_failed_refuses_a_job_this_worker_no_longer_owns(conn, worker_id):
     assert job["last_error"] is None
 
 
-def test_heartbeat_stops_extending_past_the_execution_ceiling(conn, worker_id):
+def test_heartbeat_stops_extending_a_job_past_its_execution_ceiling(conn, worker_id):
     """
-    Without a ceiling the heartbeat props up a hung task forever, so the
-    reaper can never recover it. This loop must return on its own even
-    though stop_event is never set.
+    Without a ceiling the heartbeat props up a hung task forever and the
+    reaper can never recover it. The deadline is per job, so a hung job
+    must stop being extended without affecting the others this worker
+    holds.
     """
-    job_id = enqueue(conn, "some_task", {})
+    hung_id = enqueue(conn, "some_task", {})
+    healthy_id = enqueue(conn, "some_task", {})
     conn.commit()
-    claim_next_job(conn, worker_id, lease_seconds=60)
+    claim_jobs(conn, worker_id, lease_seconds=60, batch_size=2)
 
-    never_set = threading.Event()
-    started = monotonic()
-    _heartbeat_loop(
-        conn, job_id, worker_id, 60, 0.05, never_set, max_execution_seconds=0.2
-    )
+    heartbeat_conn = get_connection()
+    heartbeat = _Heartbeat(heartbeat_conn, worker_id, lease_seconds=60, interval=0.05)
+    heartbeat.start()
+    try:
+        heartbeat.hold([hung_id], max_execution_seconds=0.1)  # expires almost at once
+        heartbeat.hold([healthy_id])  # no deadline: extended indefinitely
+        sleep(0.5)
 
-    assert monotonic() - started < 5.0
+        hung_before = get_job(conn, hung_id)["locked_until"]
+        healthy_before = get_job(conn, healthy_id)["locked_until"]
+        sleep(0.5)
+
+        assert get_job(conn, hung_id)["locked_until"] == hung_before
+        assert get_job(conn, healthy_id)["locked_until"] > healthy_before
+    finally:
+        heartbeat.stop()
+        heartbeat_conn.close()
 
 
 def test_reap_dead_letters_a_job_that_keeps_killing_its_worker(conn, worker_id):

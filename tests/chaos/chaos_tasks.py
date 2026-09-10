@@ -42,6 +42,16 @@ def chaos_task(effect_key: str) -> None:
 
 
 @task
+def sleep_task(seconds: float) -> None:
+    """
+    Blocks without touching the database, so wall-clock time across a
+    batch reveals whether a worker's slots actually overlap or merely
+    take turns.
+    """
+    time.sleep(seconds)
+
+
+@task
 def transactional_chaos_task(conn, effect_key: str) -> None:
     """
     The transactional counterpart to chaos_task, run against the same

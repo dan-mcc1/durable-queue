@@ -26,56 +26,132 @@ def enqueue(
     already enqueued" without having to catch a database error, which
     matters when the caller enqueuing it might itself be retried.
     """
+    # The notify rides along in the same statement as the insert rather
+    # than following it. Two round trips cost 0.960ms of the caller's
+    # transaction against 0.509ms for one, measured with the commit
+    # excluded because the commit belongs to the caller, not to us.
+    # That gap is pure latency added to whatever request is enqueuing.
+    #
+    # Still deliberately inside the caller's transaction: Postgres only
+    # delivers a NOTIFY when that transaction commits, so a job
+    # enqueued in a transaction that rolls back never wakes anyone.
+    # Identical notifications within one transaction are collapsed,
+    # so a bulk fan-out costs one wakeup, not one per job.
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO jobs (task, args, idempotency_key)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
-            RETURNING id
+            WITH inserted AS (
+                INSERT INTO jobs (task, args, idempotency_key)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+                RETURNING id
+            )
+            SELECT id, pg_notify(%s, '') FROM inserted
             """,
-            (task, Jsonb(args), idempotency_key),
+            (task, Jsonb(args), idempotency_key, JOB_NOTIFY_CHANNEL),
         )
         new_id = cur.fetchone()["id"]
-
-        # Deliberately inside the caller's transaction: Postgres only
-        # delivers a NOTIFY when that transaction commits, so a job
-        # enqueued in a transaction that rolls back never wakes anyone.
-        # Identical notifications within one transaction are collapsed,
-        # so a bulk fan-out costs one wakeup, not one per job.
-        cur.execute("SELECT pg_notify(%s, '')", (JOB_NOTIFY_CHANNEL,))
     return new_id
+
+
+def enqueue_many(
+        conn: psycopg.Connection,
+        task: str,
+        args_list: list[dict],
+        *,
+        idempotency_keys: list[str | None] | None = None) -> list[int]:
+    """
+    Enqueue many jobs in one statement, waking workers once. Returns the
+    job ids.
+
+    Use this for fan-out - one hourly job writing a row per user, say.
+    Calling enqueue() in a loop is wrong twice over: it costs a round
+    trip per job (~1ms locally, so 30 seconds for 30k jobs against well
+    under one), and it emits a notification per row. That second part
+    is not merely wasteful: every listening worker wakes at the same
+    instant and issues its claim simultaneously, and at high slot counts
+    that synchronised stampede produced enough lock-manager contention
+    to wedge the queue outright. One notification per batch is all a
+    worker needs - it only has to learn that work exists, not how much.
+    """
+    if not args_list:
+        return []
+    if idempotency_keys is None:
+        idempotency_keys = [None] * len(args_list)
+
+    # One statement, as in enqueue(). pg_notify runs once per inserted
+    # row here rather than once for the batch, which sounds worse than
+    # it measures: Postgres collapses identical notifications within a
+    # transaction, so the wakeup count is unchanged, and 10,000 rows
+    # took 126ms this way against 136ms as two statements.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH inserted AS (
+                INSERT INTO jobs (task, args, idempotency_key)
+                SELECT %s, a, k FROM unnest(%s::jsonb[], %s::text[]) AS t(a, k)
+                ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+                RETURNING id
+            )
+            SELECT id, pg_notify(%s, '') FROM inserted
+            """,
+            (task, [Jsonb(a) for a in args_list], list(idempotency_keys), JOB_NOTIFY_CHANNEL),
+        )
+        ids = [row["id"] for row in cur.fetchall()]
+    return ids
+
+
+def claim_jobs(
+        conn: psycopg.Connection,
+        worker_id: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        batch_size: int = 1) -> list[dict]:
+    """
+    Claim up to batch_size jobs in one round trip.
+
+    Claiming one job at a time costs a round trip per job (measured at
+    ~1.7ms against a local database, against ~0.1ms per job when
+    claiming ten). The worker still *runs* one job at a time - only the
+    claim is batched - so the "one job per worker" model is unchanged.
+
+    What does change: a worker holds every claimed lease until it works
+    through the batch, so a crash returns the whole batch to the reaper
+    rather than a single job, and the heartbeat has to keep every held
+    lease alive, not just the running one.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+            SET status = 'running', locked_by = %s, locked_until = now() + %s
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE status = 'pending' AND run_at <= now()
+                ORDER BY run_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            RETURNING id, task, args
+            """,
+            (worker_id, timedelta(seconds=lease_seconds), batch_size),
+        )
+        rows = cur.fetchall()
+    # Commit even when nothing was claimed. Returning early without a
+    # commit leaves this connection "idle in transaction" for the whole
+    # poll interval, which pins Postgres's xmin horizon and stops
+    # autovacuum from reclaiming dead tuples anywhere in the database -
+    # a worker sitting on an empty queue would quietly sabotage the very
+    # bloat behaviour M10 exists to measure. (A no-op under autocommit.)
+    conn.commit()
+    return rows
 
 
 def claim_next_job(
         conn: psycopg.Connection,
         worker_id: str,
         lease_seconds: int = DEFAULT_LEASE_SECONDS) -> dict | None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE jobs
-            SET status = 'running', locked_by = %s, locked_until = now() + %s
-            WHERE id = (
-                SELECT id FROM jobs
-                WHERE status = 'pending' AND run_at <= now()
-                ORDER BY run_at, id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING id, task, args
-            """,
-            (worker_id, timedelta(seconds=lease_seconds)),
-        )
-        row = cur.fetchone()
-    # Commit even when nothing was claimed. Returning early without a
-    # commit leaves this connection "idle in transaction" for the whole
-    # poll interval, which pins Postgres's xmin horizon and stops
-    # autovacuum from reclaiming dead tuples anywhere in the database -
-    # a worker sitting on an empty queue would quietly sabotage the very
-    # bloat behaviour M10 exists to measure.
-    conn.commit()
-    return row
+    claimed = claim_jobs(conn, worker_id, lease_seconds, batch_size=1)
+    return claimed[0] if claimed else None
 
 
 def extend_lease(
@@ -102,7 +178,35 @@ def extend_lease(
     conn.commit()
 
 
-def reap_expired_jobs(conn: psycopg.Connection) -> int:
+def extend_leases(
+        conn: psycopg.Connection,
+        job_ids: list[int],
+        worker_id: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS) -> None:
+    """
+    Heartbeat for every lease this worker holds, not just the running
+    job: with batch claiming, jobs still waiting their turn in the
+    worker's buffer hold leases too, and would otherwise be reaped out
+    from under it while it works through the batch.
+    """
+    if not job_ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+            SET locked_until = now() + %s
+            WHERE id = ANY(%s) AND locked_by = %s AND status = 'running'
+            """,
+            (timedelta(seconds=lease_seconds), job_ids, worker_id),
+        )
+    conn.commit()
+
+
+DEFAULT_REAP_BATCH = 100
+
+
+def reap_expired_jobs(conn: psycopg.Connection, reap_batch: int = DEFAULT_REAP_BATCH) -> int:
     """
     Return any job whose lease expired back to pending, and dead-letter
     the ones that keep taking their worker down with them. Returns the
@@ -113,6 +217,14 @@ def reap_expired_jobs(conn: psycopg.Connection) -> int:
     never stop it - reap, claim, crash, forever. Counting recoveries
     separately from failures is what bounds that: a crash isn't a
     failure, but enough of them is still a poison pill.
+
+    Both sweeps go through a FOR UPDATE SKIP LOCKED subquery, and are
+    bounded. Without that this was an unrestricted UPDATE over every
+    running row, which blocks on any row a claim currently holds - and
+    every worker runs one of these. Under load that produced pile-ups
+    on the lock manager severe enough to wedge the queue entirely.
+    Skipping contended rows costs nothing: an expired lease that isn't
+    reaped this sweep is reaped on the next one.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -121,9 +233,15 @@ def reap_expired_jobs(conn: psycopg.Connection) -> int:
             SET status = 'dead', finished_at = now(), recoveries = recoveries + 1,
                 locked_by = NULL, locked_until = NULL,
                 last_error = 'worker repeatedly died while running this job'
-            WHERE status = 'running' AND locked_until < now()
-              AND recoveries + 1 >= max_recoveries
-            """
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE status = 'running' AND locked_until < now()
+                  AND recoveries + 1 >= max_recoveries
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            """,
+            (reap_batch,),
         )
         dead_lettered = cur.rowcount
 
@@ -132,8 +250,14 @@ def reap_expired_jobs(conn: psycopg.Connection) -> int:
             UPDATE jobs
             SET status = 'pending', recoveries = recoveries + 1,
                 locked_by = NULL, locked_until = NULL
-            WHERE status = 'running' AND locked_until < now()
-            """
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE status = 'running' AND locked_until < now()
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            """,
+            (reap_batch,),
         )
         recovered = cur.rowcount
     conn.commit()
@@ -236,6 +360,61 @@ def mark_failed(conn: psycopg.Connection, job_id: int, worker_id: str, error: st
             )
     conn.commit()
     return True
+
+
+def delete_completed_jobs(
+        conn: psycopg.Connection,
+        older_than_seconds: float,
+        batch: int = 1000) -> int:
+    """
+    Delete jobs that finished longer than older_than_seconds ago.
+    Returns how many were removed.
+
+    What this buys, and what it does not: retaining completed rows costs
+    storage and autovacuum work, and makes any query that scans the whole
+    table more expensive. It does NOT slow down claiming - measured at
+    0.237ms with 200k completed rows retained against 0.256ms with none,
+    because the claim's partial index contains only pending rows, so
+    completed ones were never in its path. An earlier version of this
+    docstring claimed otherwise; the measurement disagreed.
+
+    Worth knowing why the rows pile up in the first place: HOT updates
+    are impossible on this table, since status appears in the predicate
+    of both partial indexes and Postgres treats predicate columns as
+    indexed. Every pending -> running -> succeeded transition therefore
+    writes a fresh heap tuple plus index entries - 404 HOT updates out of
+    528,839 measured, and a heap of ~450 bytes per row against a real row
+    nearer 120.
+
+    Idempotency caveat, and it is a real one: deleting a row frees its
+    idempotency_key, after which that key can be enqueued again. The
+    retention window must therefore outlast the longest period you need
+    enqueue-time dedup over - for scheduler keys (sched:<name>:<run_at>)
+    comfortably more than one interval. That is a policy decision rather
+    than something this function can make for you, because you cannot
+    both forget a key and promise it will never be reused.
+
+    Ordering by id lets the inner select walk the primary key and stop
+    early, so no extra index is needed on the hot completion path.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM jobs
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE status IN ('succeeded', 'dead')
+                  AND finished_at < now() - %s
+                ORDER BY id
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            """,
+            (timedelta(seconds=older_than_seconds), batch),
+        )
+        deleted = cur.rowcount
+    conn.commit()
+    return deleted
 
 
 def get_job(conn: psycopg.Connection, job_id: int) -> dict | None:

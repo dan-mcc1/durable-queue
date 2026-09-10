@@ -1,4 +1,37 @@
-from durable_queue.jobs import claim_next_job, enqueue, mark_succeeded
+from durable_queue.jobs import claim_next_job, enqueue, enqueue_many, mark_succeeded
+
+
+def test_enqueue_many_creates_every_job_in_one_statement(conn):
+    ids = enqueue_many(conn, "fan_out", [{"user": 1}, {"user": 2}, {"user": 3}])
+    conn.commit()
+
+    assert len(ids) == 3
+    with conn.cursor() as cur:
+        cur.execute("SELECT task, args, status FROM jobs ORDER BY id")
+        rows = cur.fetchall()
+    assert [r["args"]["user"] for r in rows] == [1, 2, 3]
+    assert all(r["task"] == "fan_out" and r["status"] == "pending" for r in rows)
+
+
+def test_enqueue_many_handles_an_empty_list(conn):
+    assert enqueue_many(conn, "fan_out", []) == []
+
+
+def test_enqueue_many_dedupes_on_idempotency_key(conn):
+    first = enqueue_many(
+        conn, "fan_out", [{"u": 1}, {"u": 2}], idempotency_keys=["k1", "k2"]
+    )
+    conn.commit()
+
+    again = enqueue_many(
+        conn, "fan_out", [{"u": 1}, {"u": 3}], idempotency_keys=["k1", "k3"]
+    )
+    conn.commit()
+
+    assert again[0] == first[0]  # k1 returned its existing job
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS n FROM jobs")
+        assert cur.fetchone()["n"] == 3  # k1, k2, k3 - not four
 
 
 def test_enqueue_creates_pending_row(conn):
