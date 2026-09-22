@@ -34,23 +34,23 @@ def award_credit(conn, user_id: str, amount: int):
 Two chaos tests make the difference concrete. Both kill real worker
 subprocesses mid-job, at random, with no cleanup opportunity:
 
-| | duplicated effects |
-|---|---|
-| effects-ledger task (external-shaped side effect) | 4–6 out of 24 |
-| transactional task (`conn` parameter) | **0 out of 24** |
+|                                                   | duplicated effects |
+| ------------------------------------------------- | ------------------ |
+| effects-ledger task (external-shaped side effect) | 4–6 out of 24      |
+| transactional task (`conn` parameter)             | **0 out of 24**    |
 
 ## Features
 
-| | |
-|---|---|
-| **Atomic claiming** | `FOR UPDATE SKIP LOCKED`, so N workers never hand out the same job twice |
-| **Crash recovery** | Leases + heartbeats + a reaper, with a ceiling so a hung task can't hold its lease forever |
-| **Retries** | Exponential backoff with full jitter; poison pills that crash their worker are dead-lettered by recovery count |
-| **Idempotency** | Enqueue-time dedup via `idempotency_key`, effect-time dedup via an effects ledger, and true atomicity for transactional tasks |
-| **Low latency** | `LISTEN/NOTIFY` wakes an idle worker on enqueue, with polling retained as the backstop for retries and schedules |
-| **Scheduling** | Recurring schedules with `pg_try_advisory_lock` leader election, plus a per-run idempotency backstop |
-| **Observability** | `durable-queue ls / show / retry / dead / stats` |
-| **Chaos tests** | Real worker subprocesses killed mid-job, asserting invariants across many jobs and many kills |
+|                     |                                                                                                                               |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| **Atomic claiming** | `FOR UPDATE SKIP LOCKED`, so N workers never hand out the same job twice                                                      |
+| **Crash recovery**  | Leases + heartbeats + a reaper, with a ceiling so a hung task can't hold its lease forever                                    |
+| **Retries**         | Exponential backoff with full jitter; poison pills that crash their worker are dead-lettered by recovery count                |
+| **Idempotency**     | Enqueue-time dedup via `idempotency_key`, effect-time dedup via an effects ledger, and true atomicity for transactional tasks |
+| **Low latency**     | `LISTEN/NOTIFY` wakes an idle worker on enqueue, with polling retained as the backstop for retries and schedules              |
+| **Scheduling**      | Recurring schedules with `pg_try_advisory_lock` leader election, plus a per-run idempotency backstop                          |
+| **Observability**   | `durable-queue ls / show / retry / dead / stats`                                                                              |
+| **Chaos tests**     | Real worker subprocesses killed mid-job, asserting invariants across many jobs and many kills                                 |
 
 ## Benchmarks
 
@@ -66,13 +66,13 @@ fsynced. "Naive" is one job claimed per round trip, run one at a time, woken by
 polling — `--suite comparison`. "Tuned" is 8 slots per worker with a batch size
 of 25.
 
-| | naive | tuned | |
-|---|---|---|---|
-| 1 worker process | 227 | 1649 | **7.3x** |
-| 2 worker processes | 402 | 3019 | **7.5x** |
-| 4 worker processes | 658 | 4446 | **6.8x** |
-| 8 worker processes | 932 | **6078** | **6.5x** |
-| enqueue → start (p50) | 719.0 ms | 6.9 ms | **104x** |
+|                       | naive    | tuned    |          |
+| --------------------- | -------- | -------- | -------- |
+| 1 worker process      | 227      | 1649     | **7.3x** |
+| 2 worker processes    | 402      | 3019     | **7.5x** |
+| 4 worker processes    | 658      | 4446     | **6.8x** |
+| 8 worker processes    | 932      | **6078** | **6.5x** |
+| enqueue → start (p50) | 719.0 ms | 6.9 ms   | **104x** |
 
 **How much of that is the library?** Same claim/work/complete cycle, single
 process, with and without durable-queue in the path:
@@ -83,7 +83,7 @@ process, with and without durable-queue in the path:
   durable-queue, batch of 10         281 jobs/sec   (+76% vs raw)
 ```
 
-The library is *faster* than hand-written one-at-a-time SQL, because batching
+The library is _faster_ than hand-written one-at-a-time SQL, because batching
 amortises a round trip the naive version pays per job.
 
 ### What actually determines throughput
@@ -91,15 +91,15 @@ amortises a round trip the naive version pays per job.
 Total concurrency — jobs in flight — and very little else. Not how you split it
 between processes and threads (`--suite curve`):
 
-| jobs in flight | split | jobs/sec | marginal gain |
-|---|---|---|---|
-| 1 | 1w × 1s | 262 | — |
-| 2 | 1w × 2s | 510 | 1.95x |
-| 4 | 1w × 4s | 905 | 1.77x |
-| 8 | 1w × 8s | 1625 | 1.80x |
-| 16 | 2w × 8s | 3048 | 1.88x |
-| 32 | 4w × 8s | 4452 | 1.46x |
-| 64 | 8w × 8s | 6098 | 1.37x |
+| jobs in flight | split   | jobs/sec | marginal gain |
+| -------------- | ------- | -------- | ------------- |
+| 1              | 1w × 1s | 262      | —             |
+| 2              | 1w × 2s | 510      | 1.95x         |
+| 4              | 1w × 4s | 905      | 1.77x         |
+| 8              | 1w × 8s | 1625     | 1.80x         |
+| 16             | 2w × 8s | 3048     | 1.88x         |
+| 32             | 4w × 8s | 4452     | 1.46x         |
+| 64             | 8w × 8s | 6098     | 1.37x         |
 
 **Read scaling numbers against this curve, not in isolation.** At a fixed
 concurrency of 8, how you split it barely matters — 8w×1s gives 1570, 4w×2s
@@ -116,11 +116,11 @@ good the configuration is.
 
 **Why the knee?** Two plausible causes, both ruled out by measurement:
 
-- *Not WAL/fsync*, despite `WALWrite` waiters growing 1 → 3 → 7 → 12 with worker
+- _Not WAL/fsync_, despite `WALWrite` waiters growing 1 → 3 → 7 → 12 with worker
   count. With `synchronous_commit = off` throughput doubles but the efficiency
   curve is unchanged (100/96/91/68% against 100/97/91/76%). Removing the
   dominant I/O wait didn't alter the shape, so it was a symptom, not the limit.
-- *Not CPU or process count.* 16 cores; 8w×1s runs ~24 processes and 1w×8s ~11,
+- _Not CPU or process count._ 16 cores; 8w×1s runs ~24 processes and 1w×8s ~11,
   and both land at ~1600 jobs/sec.
 
 What remains is contention on the shared hot pages of a single queue — every
@@ -141,7 +141,7 @@ on IO.
 to 8×8 buys +37% while doubling connections from 40 to 80, against a default
 `max_connections` of 100.
 
-This benchmark also *understates* concurrency: `bench_job` waits on Postgres,
+This benchmark also _understates_ concurrency: `bench_job` waits on Postgres,
 so slots contend on the same bottleneck. A task waiting on an HTTP call
 overlaps far more cleanly.
 
@@ -151,19 +151,19 @@ overlaps far more cleanly.
 Postgres group-commits concurrent transactions into shared flushes, so the more
 commits in flight, the more of the fsync each one avoids paying for:
 
-| | fully durable | workers relaxed | cost of durability |
-|---|---|---|---|
-| 4 in flight | 973 | 1925 | 49% |
-| 16 in flight | 3065 | 4164 | 26% |
-| 32 in flight | 4452 | 5626 | 21% |
-| 64 in flight | 5882 | 6478 | **9%** |
+|              | fully durable | workers relaxed | cost of durability |
+| ------------ | ------------- | --------------- | ------------------ |
+| 4 in flight  | 973           | 1925            | 49%                |
+| 16 in flight | 3065          | 4164            | 26%                |
+| 32 in flight | 4452          | 5626            | 21%                |
+| 64 in flight | 5882          | 6478            | **9%**             |
 
 So `durable_bookkeeping=False` matters far less than it first appears — at real
 concurrency you get full fsync-per-commit durability for single-digit percent,
 and the default should stay on.
 
 `commit_delay` (group commit) buys nothing here and costs latency (−11% at
-1000µs, −28% at 2000µs with 4 workers), because Postgres is *already* group
+1000µs, −28% at 2000µs with 4 workers), because Postgres is _already_ group
 committing — that is exactly what the 49% → 9% fall above is.
 
 **Which commits actually need to survive a crash?** A worker makes two per job —
@@ -220,10 +220,10 @@ the cost of durable writes.
 Calling `enqueue()` in a loop is wrong twice over — a round trip per job, and a
 notification per job:
 
-| 30,000 jobs | |
-|---|---|
-| `enqueue()` in a loop | ~30 s |
-| `enqueue_many()` | **0.35 s** |
+| 30,000 jobs           |            |
+| --------------------- | ---------- |
+| `enqueue()` in a loop | ~30 s      |
+| `enqueue_many()`      | **0.35 s** |
 
 ### Reading these numbers
 
@@ -247,8 +247,13 @@ python -m durable_queue.worker      # a worker
 python -m durable_queue.scheduler   # the scheduler
 durable-queue stats                 # inspect the queue
 durable-queue purge --older-than-hours 24   # drop completed jobs past retention
+durable-queue purge --older-than-hours 24   # drop completed jobs past retention
 pytest
 ```
+
+For fan-out, use `enqueue_many` rather than a loop of `enqueue` — see above.
+For a production worker, `run_worker(concurrency=8, batch_size=25)` is the
+measured sweet spot.
 
 For a production worker, `run_worker(concurrency=8, batch_size=25)` is the
 measured sweet spot. Budget connections: a process needs `concurrency + 2`, so
