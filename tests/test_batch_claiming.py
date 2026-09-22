@@ -99,8 +99,8 @@ def test_a_whole_abandoned_batch_is_recovered_not_just_the_running_job(conn, wor
 
 def test_batch_claiming_never_hands_the_same_job_to_two_workers(conn):
     """
-    The M2 guarantee, re-proven for the batched claim: the subquery
-    still uses FOR UPDATE SKIP LOCKED, but it now selects many rows at
+    The no-double-claim guarantee, re-proven for the batched claim: the
+    subquery still uses FOR UPDATE SKIP LOCKED, but selects many rows at
     once, so it's worth confirming nothing overlaps.
     """
     job_count = 60

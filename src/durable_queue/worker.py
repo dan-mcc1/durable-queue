@@ -189,9 +189,8 @@ def run_job(
         if registered.wants_connection:
             # Exactly-once, not at-least-once: the task's writes and the
             # job's completion land in one commit, so a crash can't
-            # leave the work done but unrecorded (or vice versa). This
-            # is the case DESIGN.md's "no clean answer" argument doesn't
-            # cover, because nothing here leaves the database.
+            # leave the work done but unrecorded (or vice versa). Only
+            # possible because nothing here leaves the database.
             with conn.transaction():
                 registered.fn(conn=conn, **job["args"])
                 if not mark_succeeded_in_transaction(conn, job["id"], worker_id):

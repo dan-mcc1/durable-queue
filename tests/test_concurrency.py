@@ -13,10 +13,9 @@ def concurrency_noop() -> None:
 
 def test_claim_next_job_never_double_claims_under_concurrency(conn):
     """
-    The M2 guarantee: with many workers racing for the same jobs, every
-    job is claimed exactly once, never zero times, never twice. Before
-    the FOR UPDATE SKIP LOCKED fix, this test would have failed by
-    claiming some jobs more than once.
+    With many workers racing for the same jobs, every job is claimed
+    exactly once, never zero times, never twice. This is what FOR UPDATE
+    SKIP LOCKED buys; without it, workers hand out the same row twice.
     """
     job_count = 20
     worker_count = 8

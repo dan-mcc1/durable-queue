@@ -32,8 +32,8 @@ def chaos_task(effect_key: str) -> None:
         conn.commit()
 
         # Widens the window a randomly-timed kill can land in, between
-        # the effect happening and it being recorded as done - the
-        # exact gap M5's design doc calls unavoidable.
+        # the effect happening and it being recorded as done - the gap
+        # no ledger can close when the effect is external.
         time.sleep(random.uniform(0.05, 0.2))
 
         record_effect(conn, effect_key)

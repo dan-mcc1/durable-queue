@@ -3,13 +3,12 @@ A concrete "large math problem split into sub-problems" test: sum
 every integer from 1 to N by fanning out into many independent chunk
 jobs, each solved by whichever worker gets to it, with the last chunk
 to finish triggering a combine step that produces the final answer.
-Run under the same kind of chaos as M8's test_invariants.py (workers
-killed at random with no chance to clean up), reusing the same
-harness shape.
+Run under the same kind of chaos as test_invariants.py (workers killed
+at random with no chance to clean up), reusing the same harness shape.
 
 The result asserted here is exact, not "small number of duplicates
-expected" the way M8's chaos_task result is - see math_tasks.py for
-why: recording a chunk and counting it share one Postgres transaction
+expected" the way the effects-ledger chaos task's is - see
+math_tasks.py: recording a chunk and counting it share one transaction
 with no external call in between, so a kill can't split them apart
 the way it can with something like an email send.
 """
@@ -74,7 +73,7 @@ def test_sum_of_a_range_is_exactly_correct_despite_workers_being_killed(conn):
             time.sleep(random.uniform(0.2, 0.4))
             victim = random.choice(workers)
             if victim.poll() is None:  # still alive
-                victim.kill()  # no cleanup opportunity, same as M8
+                victim.kill()  # no cleanup opportunity
                 victim.wait()
                 workers.remove(victim)
                 workers.append(_spawn_worker())

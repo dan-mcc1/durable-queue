@@ -139,9 +139,8 @@ def claim_jobs(
     # Commit even when nothing was claimed. Returning early without a
     # commit leaves this connection "idle in transaction" for the whole
     # poll interval, which pins Postgres's xmin horizon and stops
-    # autovacuum from reclaiming dead tuples anywhere in the database -
-    # a worker sitting on an empty queue would quietly sabotage the very
-    # bloat behaviour M10 exists to measure. (A no-op under autocommit.)
+    # autovacuum from reclaiming dead tuples anywhere in the database.
+    # (A no-op under autocommit.)
     conn.commit()
     return rows
 
@@ -375,8 +374,7 @@ def delete_completed_jobs(
     table more expensive. It does NOT slow down claiming - measured at
     0.237ms with 200k completed rows retained against 0.256ms with none,
     because the claim's partial index contains only pending rows, so
-    completed ones were never in its path. An earlier version of this
-    docstring claimed otherwise; the measurement disagreed.
+    completed ones were never in its path.
 
     Worth knowing why the rows pile up in the first place: HOT updates
     are impossible on this table, since status appears in the predicate

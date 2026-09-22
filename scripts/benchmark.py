@@ -228,8 +228,7 @@ def measure_single_process_library(conn, *, job_count: int, batch_size: int) -> 
     """
     durable-queue draining the same queue in one process, taking the
     same path run_worker does - batched claims on an autocommit
-    connection - so this measures what a worker actually costs rather
-    than a path nothing uses any more.
+    connection - so this measures what a real worker costs.
     """
     _reset(conn)
     now = time.time()
@@ -303,11 +302,10 @@ def run_comparison_suite(conn, *, job_count: int, poll_interval: float) -> None:
     """
     Naive versus tuned, measured back to back on the same machine.
 
-    Not every improvement is reachable by flags - reaper throttling, the
-    reused heartbeat connection and the shared heartbeat thread are now
-    unconditional - so the "naive" column here is already faster than
-    the original code was. It understates the total gain rather than
-    inflating it.
+    "Naive" is one job claimed per round trip, run one at a time, woken
+    by polling. Reaper throttling, the reused heartbeat connection and
+    the shared heartbeat thread are unconditional and apply to both
+    columns, so this isolates batching, slots and NOTIFY.
     """
     print()
     print("  throughput (jobs/sec)      naive      tuned    speedup")

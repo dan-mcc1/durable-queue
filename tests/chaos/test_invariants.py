@@ -1,13 +1,12 @@
 """
-M8: chaos testing. Real worker subprocesses, killed with no chance to
+Chaos testing. Real worker subprocesses, killed with no chance to
 clean up (SIGKILL on POSIX; Popen.kill() maps to TerminateProcess on
 Windows, which is the equivalent no-cleanup-opportunity primitive on a
 platform that has no real SIGKILL), while jobs are actually in flight.
 
-This tests a property across many jobs and many kills - "nothing is
-ever lost or duplicated, no matter when a worker dies" - rather than a
-single hand-picked example. That's the difference between this and
-every earlier test in the suite.
+Asserts a property across many jobs and many kills - "nothing is ever
+lost or duplicated, no matter when a worker dies" - rather than a
+single hand-picked example.
 """
 import random
 import subprocess
