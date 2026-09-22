@@ -11,7 +11,7 @@ with conn.transaction():
 # both land, or neither does
 ```
 
-See [DESIGN.md](DESIGN.md) for the full scope, architecture, data model, and milestone ladder.
+See [DESIGN.md](DESIGN.md) for the architecture and data model.
 
 ## Exactly-once, for effects that live in Postgres
 
@@ -39,7 +39,7 @@ subprocesses mid-job, at random, with no cleanup opportunity:
 | effects-ledger task (external-shaped side effect) | 4–6 out of 24 |
 | transactional task (`conn` parameter) | **0 out of 24** |
 
-## What's built
+## Features
 
 | | |
 |---|---|
@@ -63,7 +63,8 @@ run drains in well under a second.
 
 Both configurations measured back to back, same machine, same run, every commit
 fsynced. "Naive" is one job claimed per round trip, run one at a time, woken by
-polling — `--suite comparison`.
+polling — `--suite comparison`. "Tuned" is 8 slots per worker with a batch size
+of 25.
 
 | | naive | tuned | |
 |---|---|---|---|
@@ -72,30 +73,6 @@ polling — `--suite comparison`.
 | 4 worker processes | 658 | 4446 | **6.8x** |
 | 8 worker processes | 932 | **6078** | **6.5x** |
 | enqueue → start (p50) | 719.0 ms | 6.9 ms | **104x** |
-
-The tuned column is 8 slots per worker with a batch size of 25. The naive column
-is already faster than the original code — reaper throttling, the reused
-heartbeat connection, the shared heartbeat thread and the `(run_at, id)` index
-are all unconditional now and can't be switched off — so this understates the
-total gain rather than inflating it.
-
-**Concurrency also pays for durability.** The ~50% durability cost is largely an
-artifact of *low* concurrency. Every commit needs a WAL flush, but Postgres
-group-commits concurrent transactions into shared flushes, so the more commits
-in flight, the more of the fsync each one avoids paying for:
-
-| | fully durable | workers relaxed | cost of durability |
-|---|---|---|---|
-| 4 in flight | 973 | 1925 | 49% |
-| 16 in flight | 3065 | 4164 | 26% |
-| 32 in flight | 4452 | 5626 | 21% |
-| 64 in flight | 5882 | 6478 | **9%** |
-
-So `durable_bookkeeping=False` matters far less than it first appeared — at real
-concurrency you get full fsync-per-commit durability for single-digit percent,
-and the default should stay on. Budget connections though: a process needs
-`concurrency + 2`, so 8 workers × 8 slots is 80 against Postgres's default
-`max_connections` of 100.
 
 **How much of that is the library?** Same claim/work/complete cycle, single
 process, with and without durable-queue in the path:
@@ -106,8 +83,8 @@ process, with and without durable-queue in the path:
   durable-queue, batch of 10         281 jobs/sec   (+76% vs raw)
 ```
 
-The library is now *faster* than hand-written one-at-a-time SQL, because
-batching amortises a round trip the naive version pays per job.
+The library is *faster* than hand-written one-at-a-time SQL, because batching
+amortises a round trip the naive version pays per job.
 
 ### What actually determines throughput
 
@@ -165,27 +142,32 @@ to 8×8 buys +37% while doubling connections from 40 to 80, against a default
 `max_connections` of 100.
 
 This benchmark also *understates* concurrency: `bench_job` waits on Postgres,
-so slots contend on the same bottleneck. A task waiting on an HTTP call — what
-ReleaseRadar's jobs actually do — overlaps far more cleanly.
+so slots contend on the same bottleneck. A task waiting on an HTTP call
+overlaps far more cleanly.
 
-An earlier version of this section reported processes beating threads roughly
-2:1 and attributed it to the GIL. That was wrong: it was a barrier in the
-worker loop (see the trail below) that penalised high slot counts specifically.
-Kept here as a reminder that a plausible explanation for a real measurement can
-still be the wrong one.
+### Durability
 
-**What does durability cost, and which parts of it do you actually need?**
+**Concurrency pays for durability.** Every commit needs a WAL flush, but
+Postgres group-commits concurrent transactions into shared flushes, so the more
+commits in flight, the more of the fsync each one avoids paying for:
 
-At 4 workers × 1 slot, where the fsync cost is most exposed:
+| | fully durable | workers relaxed | cost of durability |
+|---|---|---|---|
+| 4 in flight | 973 | 1925 | 49% |
+| 16 in flight | 3065 | 4164 | 26% |
+| 32 in flight | 4452 | 5626 | 21% |
+| 64 in flight | 5882 | 6478 | **9%** |
 
-```
-  everything durable                 939 jobs/sec   (every commit fsynced)
-  workers relaxed                   1977 jobs/sec   (enqueues still durable)
-  nothing durable                   1977 jobs/sec   (an enqueue can vanish)
-```
+So `durable_bookkeeping=False` matters far less than it first appears — at real
+concurrency you get full fsync-per-commit durability for single-digit percent,
+and the default should stay on.
 
-Not every commit needs to survive a crash. A worker makes two per job — the
-claim and the completion — and losing either one is not data loss, it's a
+`commit_delay` (group commit) buys nothing here and costs latency (−11% at
+1000µs, −28% at 2000µs with 4 workers), because Postgres is *already* group
+committing — that is exactly what the 49% → 9% fall above is.
+
+**Which commits actually need to survive a crash?** A worker makes two per job —
+the claim and the completion — and losing either is not data loss, it's a
 re-run: the job reverts to `pending` and executes again, which is the
 at-least-once path this queue already implements and tests. The commit that
 genuinely must survive is the **enqueue**, because losing that means work was
@@ -194,96 +176,44 @@ application's transaction, not the worker's.
 
 Since `synchronous_commit` is per-transaction, you can have both. Workers run
 with `run_worker(durable_bookkeeping=False)`, enqueues stay fully durable, and
-throughput roughly doubles — landing on top of the fully-relaxed number,
-because worker commits vastly outnumber enqueue commits. Nothing the queue
-guarantees is weakened.
-
-The real cost is a higher chance of duplicate execution after a hard crash,
-since completions confirmed just before it can disappear. Transactional tasks
-are unaffected — their writes vanish with the completion and are simply redone.
-Tasks with external side effects lean harder on their idempotency keys.
+throughput roughly doubles, because worker commits vastly outnumber enqueue
+commits. Nothing the queue guarantees is weakened. The real cost is a higher
+chance of duplicate execution after a hard crash, since completions confirmed
+just before it can disappear. Transactional tasks are unaffected — their writes
+vanish with the completion and are simply redone. Tasks with external side
+effects lean harder on their idempotency keys.
 
 This is also the honest frame for comparing against a Redis-backed queue: much
 of what such a system "wins" on throughput, it wins by not fsyncing. The
 interesting question isn't who is faster, it's which commits each one is
 willing to lose.
 
-**What didn't work:** `commit_delay` (group commit) was expected to recover some
-of that durability cost for free, since it batches fsyncs across concurrent
-transactions without giving up any durability. Measured, it doesn't:
+### Why the claim path looks the way it does
 
-| commit_delay | 4 workers | 8 workers |
-|---|---|---|
-| 0µs | baseline | baseline |
-| 500µs | +0% | +0% |
-| 1000µs | −11% | +0% |
-| 2000µs | −28% | −17% |
+Under load — 30k jobs, 8 workers × 8 slots — the queue would stop dead: zero
+jobs processed, indefinitely, with 63 backends waiting on `LWLock:LockManager`
+holding granted `tuple` locks, which is exactly what `SKIP LOCKED` is supposed
+to prevent. Three independent causes, each now a constraint worth keeping:
 
-The reason, which only became clear later: Postgres was **already** group
-committing. The durability table above shows the fsync cost falling from 49% to
-9% purely by raising concurrency — that fall *is* group commit working on its
-own. `commit_delay` exists to manufacture batching that isn't happening
-naturally; here it already was, so the delay bought nothing and cost latency.
-(An earlier version of this section blamed "not enough concurrent commits to
-batch," which the durability measurements contradict.)
+1. **The index is on `(run_at, id)`, not `run_at` alone.** A bulk enqueue gives
+   every row an identical `run_at` (`now()` is fixed per transaction), so
+   `ORDER BY run_at, id` degenerated into one giant incremental-sort group:
+   claiming 25 jobs read and sorted all 30,000 at **5.18ms and 2MB of sort
+   memory per claim**, held while locking rows. The composite index makes it an
+   index-ordered scan of exactly 25 rows: **0.052ms**.
+2. **The reaper is bounded and skip-locked.** As an unbounded
+   `UPDATE ... WHERE status = 'running'` it blocked on any row a claim held —
+   and every worker runs one. An expired lease missed by one sweep is caught by
+   the next.
+3. **`enqueue_many` inserts in one statement and notifies once.** Per-row
+   notifications meant 30,000 jobs woke every listening worker 30,000 times,
+   and on commit they all issued claims in the same instant. That synchronised
+   stampede was the actual trigger — with NOTIFY disabled the stall vanished
+   entirely.
 
-### The optimisation trail
-
-Every number below is 4 worker processes, fully durable, measured by
-`scripts/benchmark.py` — each step found by profiling rather than guessing:
-
-| | jobs/sec |
-|---|---|
-| first measurement | 162 |
-| reuse one heartbeat connection per worker (was one per *job*, ~13ms) | 386 |
-| throttle the reaper (was sweeping before every job) | 489 |
-| batch claiming + autocommit (claim was a round trip per job) | 844 |
-| one heartbeat thread per worker (was one per job, ~0.13ms) | 865 |
-| 8 concurrency slots per worker | 2400 |
-| refill the slot queue continuously instead of draining each batch first | 3820 |
-| index on `(run_at, id)`, bounded skip-locked reaper, one notify per batch | **4452** |
-
-**27x at 4 workers**, all of it fully durable. At 8 workers × 8 slots the same
-build reaches **6098 jobs/sec**.
-
-### The stall that wasn't a slowness problem
-
-Under load — 30k jobs, 8 workers × 8 slots — the queue would sometimes stop
-dead. Not slow: **zero jobs processed**, indefinitely, until the workers were
-killed. `pg_stat_activity` caught it: 63 backends waiting on
-`LWLock:LockManager`, with granted `tuple` locks, meaning sessions were queued
-behind each other's row locks — exactly what `SKIP LOCKED` is supposed to
-prevent.
-
-Three causes, found in order, each needing the previous one fixed to become
-visible:
-
-1. **The claim query sorted the entire pending backlog on every call.** A bulk
-   enqueue gives every row an identical `run_at` (`now()` is fixed per
-   transaction), and the index was on `run_at` alone — so `ORDER BY run_at, id`
-   degenerated into one giant incremental-sort group. Claiming 25 jobs read and
-   sorted all 30,000: **5.18ms and 2MB of sort memory per claim**, held while
-   locking rows. Adding `id` to the index made it an index-ordered scan of
-   exactly 25 rows: **0.052ms, ~100x**.
-2. **The reaper was an unbounded `UPDATE ... WHERE status = 'running'` with no
-   `SKIP LOCKED`**, so it blocked on any row a claim held — and every worker
-   runs one. Now bounded and skip-locked; an expired lease missed this sweep is
-   caught by the next.
-3. **`enqueue` emits one notification per row.** Bulk-enqueueing 30,000 jobs
-   fired 30,000 notifications, and on commit every listening worker woke in the
-   same instant and issued its claim simultaneously. That synchronised stampede
-   was the actual trigger — with NOTIFY disabled the stall vanished entirely
-   (4/4 clean runs), which is what isolated it. `enqueue_many` inserts in one
-   statement and notifies once.
-
-After all three: **5/5 clean runs, ~6100 jobs/sec, and `LWLock:LockManager`
-absent from the wait profile** — what remains is `WALWrite` and
-`BufferContent`, which is just the cost of durable writes.
-
-The lesson worth keeping: the first two fixes each improved throughput while
-leaving the stall intact. A bug that only appears at scale can have several
-independent causes stacked on top of one another, and fixing one just moves the
-threshold.
+After all three: 5/5 clean runs at ~6100 jobs/sec, with `LWLock:LockManager`
+absent from the wait profile — what remains is `WALWrite` and `BufferContent`,
+the cost of durable writes.
 
 ### Fan-out: use `enqueue_many`
 
@@ -295,35 +225,16 @@ notification per job:
 | `enqueue()` in a loop | ~30 s |
 | `enqueue_many()` | **0.35 s** |
 
-### What the harness found
+### Reading these numbers
 
-Three times the benchmark paid for itself:
-
-1. **162 → 386 jobs/sec.** The first run was slower than it should have been;
-   profiling found `process_one` opening a fresh heartbeat connection per job
-   (~13ms locally, over half the per-job budget). Reused one per worker.
-2. **23% → 1% overhead.** The remaining gap against raw Postgres was almost
-   entirely the reaper sweep running before *every job* — a commit and two
-   `UPDATE`s for work that only matters once per lease period. Throttling it to
-   a quarter of the lease closed the gap and lifted every configuration 14–27%.
-3. **A bug in the harness itself** — a `SELECT` that never committed held a read
-   lock on `jobs` and deadlocked the next phase's `TRUNCATE`. Each phase passed
-   alone; only the sequence hung.
-4. **A progress query that penalised the runs it measured.** `_drain` polled
-   `count(*) WHERE status NOT IN (...)` — a seq scan costing 2.85ms, twenty
-   times a second, growing with the table. Rephrased to match the partial index
-   predicates it became two index-only scans at 0.086ms, and the 30k-job figure
-   jumped 4286 → 5204.
-
-The instrument distorted the result three separate times (twice above, plus a
-`docker stats` sampler that starved the workers it was watching). Worth
-remembering when reading any of these numbers.
-
-One caveat on the absolute figures: this is Docker Desktop on Windows, where
-fsync goes through a virtualised filesystem and is unusually slow. The relative
-measurements — overhead, scaling efficiency, durability cost — are the ones
-worth quoting. The 8-worker runs also drain in under a second at these job
-counts, so that row is the least precise.
+This is Docker Desktop on Windows, where fsync goes through a virtualised
+filesystem and is unusually slow. The relative measurements — overhead, scaling
+efficiency, durability cost — are the ones worth quoting. The 8-worker runs
+drain in under a second at these job counts, so those rows are the least
+precise. Measurement itself distorted the results three separate times here (a
+per-job heartbeat connection, a seq-scan progress query, and a `docker stats`
+sampler that starved the workers it was watching), which is worth remembering
+when reading any benchmark.
 
 ## Running it
 
@@ -339,18 +250,12 @@ durable-queue purge --older-than-hours 24   # drop completed jobs past retention
 pytest
 ```
 
-For fan-out, use `enqueue_many` rather than a loop of `enqueue` — see above.
 For a production worker, `run_worker(concurrency=8, batch_size=25)` is the
-measured sweet spot.
+measured sweet spot. Budget connections: a process needs `concurrency + 2`, so
+8 workers × 8 slots is 80 against Postgres's default `max_connections` of 100.
 
-## Status
+## Known gaps
 
-Milestones M1–M8 complete, plus transactional tasks, LISTEN/NOTIFY, batch
-claiming, concurrency slots and the benchmark suite. **86 tests passing.**
-
-Remaining: adoption in a real application (M9); the load-test/bloat write-up
-(M10) — the bloat is now measured but `scripts/load_test.py` is still a stub;
-and the production gaps that matter more than throughput — graceful shutdown
-on SIGTERM, structured logging, reconnect after a dropped connection, real
-migrations, and the `durable-queue worker` / `scheduler` commands DESIGN.md
-specifies as the deploy entry points.
+No graceful shutdown on SIGTERM, no structured logging, no reconnect after a
+dropped connection, no real migrations, and no `durable-queue worker` /
+`scheduler` CLI entry points. 86 tests passing.
