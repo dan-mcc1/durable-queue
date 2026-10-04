@@ -17,6 +17,8 @@ Requires Postgres up and the schema applied (see README).
 """
 import argparse
 import os
+import random
+import statistics
 import subprocess
 import sys
 import time
@@ -26,7 +28,7 @@ from urllib.parse import quote
 import psycopg
 from psycopg.rows import dict_row
 
-from durable_queue.db import get_connection
+from durable_queue.db import get_connection, get_dsn
 from durable_queue.jobs import enqueue
 from durable_queue.registry import task
 from durable_queue.jobs import DEFAULT_LEASE_SECONDS, claim_jobs, enqueue_many
@@ -48,9 +50,48 @@ def bench_job(conn, enqueued_at: float) -> None:
         cur.execute("INSERT INTO bench_samples (latency_ms) VALUES (%s)", (latency_ms,))
 
 
+IO_JOB_SECONDS = 0.02
+
+
+@task
+def io_job(enqueued_at: float) -> None:
+    """
+    The shape of most real tasks: no `conn`, and nearly all of its time
+    spent waiting on something that isn't Postgres - an HTTP call,
+    stood in for by a sleep. Whether a worker holds a connection through
+    that wait is exactly what the connections suite measures.
+    """
+    time.sleep(IO_JOB_SECONDS)
+
+
+@task
+def io_job_varied(enqueued_at: float) -> None:
+    """
+    io_job with the variance real HTTP latency has - same mean, spread
+    over 10-30ms. Jobs claimed in one batch start together; with a fixed
+    sleep they also finish together, and all borrow a connection at the
+    same instant, which no real workload does.
+    """
+    time.sleep(random.uniform(IO_JOB_SECONDS / 2, IO_JOB_SECONDS * 1.5))
+
+
 def _reset(conn) -> None:
+    """
+    Empty the tables and force a checkpoint, so every run starts from
+    the same state.
+
+    The checkpoint is there because without it the timed one, every 5
+    minutes and taking 5-47s to complete here, landed in whichever runs
+    happened to overlap it. Every variant in that round came out up to
+    ~30% slow, which is larger than most of the differences being
+    measured. Forcing one now also restarts the 5-minute timer, so none
+    fires mid-run. CHECKPOINT needs superuser or pg_checkpoint, which
+    the docker-compose role has.
+    """
     with conn.cursor() as cur:
         cur.execute("TRUNCATE jobs, bench_samples")
+    conn.commit()
+    conn.execute("CHECKPOINT")
     conn.commit()
 
 
@@ -123,11 +164,31 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[index]
 
 
-def _drain(conn, *, timeout_seconds: float = 120.0) -> float:
+def _worker_connection_count(conn) -> tuple[int, int]:
+    """
+    Every connection to this database except the harness's own, as
+    (open, busy). Busy is anything not idle - a statement running or a
+    commit waiting on its flush - which is what a pool actually has to
+    supply; open also counts what the pool is merely keeping around.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n, count(*) FILTER (WHERE state <> 'idle') AS busy"
+            " FROM pg_stat_activity"
+            " WHERE datname = current_database() AND pid <> pg_backend_pid()"
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return row["n"], row["busy"]
+
+
+def _drain(conn, *, timeout_seconds: float = 120.0, on_poll=None) -> float:
     """Wait for the queue to empty, returning elapsed seconds."""
     started = time.monotonic()
     deadline = started + timeout_seconds
     while True:
+        if on_poll is not None:
+            on_poll()
         if not _any_unfinished(conn):
             return time.monotonic() - started
         if time.monotonic() > deadline:
@@ -138,22 +199,74 @@ def _drain(conn, *, timeout_seconds: float = 120.0) -> float:
         time.sleep(0.05)
 
 
-def measure_throughput(conn, *, job_count: int, worker_count: int, poll_interval: float,
+# Set by --repeat. Every throughput figure is the median of this many runs.
+REPEAT = 1
+
+
+def measure_throughput(conn, **options) -> float:
+    """
+    The median of REPEAT runs of _measure_throughput_once.
+
+    One run at 32-64 jobs in flight can still come out ~15% low, with
+    every other run of the same configuration agreeing. The likely
+    cause is autovacuum: it runs on jobs about once a minute under this
+    load, and each run starts from a truncated table Postgres believes
+    is empty, so its trigger threshold is near zero. Turning it off
+    would flatter the numbers - a real queue table is vacuumed
+    constantly - so instead no single run gets to decide a figure.
+    """
+    return statistics.median(_measure_throughput_once(conn, **options) for _ in range(REPEAT))
+
+
+def _measure_throughput_once(conn, *, job_count: int, worker_count: int, poll_interval: float,
                        dsn: str | None = None, concurrency: int = 1,
-                       batch_size: int = 10, use_notify: bool = True) -> float:
+                       batch_size: int = 10, use_notify: bool = True,
+                       task_name: str = "bench_job", connections: list | None = None) -> float:
+    """
+    Pass a list as connections to have it filled with the workers'
+    (open, busy) connection counts, sampled at every drain poll.
+
+    Timed on the database's clock, from just after the enqueue commits
+    to the last job's finished_at, rather than by when the drain loop
+    noticed the queue was empty. That loop polls every 50ms, so a run
+    that drains in two seconds was only ever timed to within ±2.5%.
+    """
     _reset(conn)
     workers = _spawn_workers(
         worker_count, use_notify=use_notify, poll_interval=poll_interval, dsn=dsn,
         concurrency=concurrency, batch_size=batch_size,
     )
+    on_poll = None
+    if connections is not None:
+        def on_poll():
+            connections.append(_worker_connection_count(conn))
     try:
         now = time.time()
-        enqueue_many(conn, "bench_job", [{"enqueued_at": now}] * job_count)
+        enqueue_many(conn, task_name, [{"enqueued_at": now}] * job_count)
         conn.commit()
-        elapsed = _drain(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT clock_timestamp() AS started_at")
+            started_at = cur.fetchone()["started_at"]
+        conn.commit()
+        _drain(conn, on_poll=on_poll)
     finally:
         _stop(workers)
-    return job_count / elapsed
+    with conn.cursor() as cur:
+        cur.execute("SELECT max(finished_at) AS finished_at FROM jobs")
+        finished_at = cur.fetchone()["finished_at"]
+    conn.commit()
+    return job_count / (finished_at - started_at).total_seconds()
+
+
+def _jobs_for(base: int, in_flight: int) -> int:
+    """
+    A run's job count, scaled with how many jobs it runs at once, so a
+    fast configuration doesn't drain in under a second and a slow one
+    doesn't take minutes. Every run then lasts long enough for startup -
+    the pool growing, the first claims, the burst of full-page writes
+    after the forced checkpoint - to be a small share of it.
+    """
+    return base * max(1, in_flight // 4)
 
 
 def measure_latency(conn, *, samples: int, worker_count: int, poll_interval: float,
@@ -267,10 +380,7 @@ def _dsn_with(**settings: str) -> str:
     no shared state to leak into the test suite and nothing to reset if
     this process dies partway through.
     """
-    base = os.environ.get(
-        "DATABASE_URL",
-        "postgres://durable_queue:durable_queue@localhost:5432/durable_queue_dev",
-    )
+    base = get_dsn()
     options = quote(" ".join(f"-c {key}={value}" for key, value in settings.items()), safe="")
     separator = "&" if "?" in base else "?"
     return f"{base}{separator}options={options}"
@@ -281,12 +391,12 @@ def _relaxed_dsn() -> str:
 
 
 def _measure_with_dsn(dsn: str, *, job_count: int, worker_count: int,
-                      poll_interval: float) -> float:
+                      poll_interval: float, **worker_options) -> float:
     tuned_conn = psycopg.connect(dsn, row_factory=dict_row)
     try:
         return measure_throughput(
             tuned_conn, job_count=job_count, worker_count=worker_count,
-            poll_interval=poll_interval, dsn=dsn,
+            poll_interval=poll_interval, dsn=dsn, **worker_options,
         )
     finally:
         tuned_conn.close()
@@ -311,12 +421,12 @@ def run_comparison_suite(conn, *, job_count: int, poll_interval: float) -> None:
     print("  throughput (jobs/sec)      naive      tuned    speedup")
     for workers in (1, 2, 4, 8):
         naive = measure_throughput(
-            conn, job_count=job_count, worker_count=workers,
+            conn, job_count=_jobs_for(job_count, workers), worker_count=workers,
             poll_interval=poll_interval, **NAIVE,
         )
         tuned = measure_throughput(
-            conn, job_count=job_count * 5, worker_count=workers,
-            poll_interval=poll_interval, **TUNED,
+            conn, job_count=_jobs_for(job_count, workers * TUNED["concurrency"]),
+            worker_count=workers, poll_interval=poll_interval, **TUNED,
         )
         print(f"  {workers} worker process(es){naive:>11.0f}{tuned:>11.0f}   {tuned / naive:>6.1f}x")
 
@@ -344,19 +454,64 @@ def run_curve_suite(conn, *, job_count: int, poll_interval: float) -> None:
     sits is how you conclude that one configuration "scales better"
     than another when both are simply walking different ranges of the
     same curve.
+
+    The second table holds jobs in flight at 8 and varies only the
+    split, which is the direct test of that claim.
     """
+    def rate_for(workers: int, slots: int) -> float:
+        return measure_throughput(
+            conn, job_count=_jobs_for(job_count, workers * slots), worker_count=workers,
+            poll_interval=poll_interval, concurrency=slots, batch_size=25,
+        )
+
     print()
     print(f"  {'in flight':>10} {'split':>10} {'jobs/sec':>10} {'marginal':>10}")
     previous = None
     for workers, slots in ((1, 1), (1, 2), (1, 4), (1, 8), (2, 8), (4, 8), (8, 8)):
-        rate = measure_throughput(
-            conn, job_count=job_count, worker_count=workers,
-            poll_interval=poll_interval, concurrency=slots, batch_size=25,
-        )
+        rate = rate_for(workers, slots)
         marginal = "-" if previous is None else f"{rate / previous:.2f}x"
         split = f"{workers}w x {slots}s"
         print(f"  {workers * slots:>10} {split:>10} {rate:>10.0f} {marginal:>10}")
         previous = rate
+
+    print()
+    print(f"  {'in flight':>10} {'split':>10} {'jobs/sec':>10}")
+    for workers, slots in ((8, 1), (4, 2), (2, 4), (1, 8)):
+        print(f"  {8:>10} {f'{workers}w x {slots}s':>10} {rate_for(workers, slots):>10.0f}")
+
+
+def run_connections_suite(conn, *, job_count: int, poll_interval: float) -> None:
+    """
+    Postgres connections held by the workers, alongside throughput.
+
+    io_job holds no transaction and spends its time waiting on something
+    other than Postgres, so a connection held through it is idle. bench_job
+    is transactional and needs its connection for the whole run, so it is
+    the check that pooling costs nothing where it can't help.
+
+    Peak open is what to budget max_connections against. Average busy is
+    what the work actually needed; the gap is connections a pool opened
+    for a burst and is keeping until they've sat idle long enough.
+    """
+    print()
+    print(f"  {'task':>13} {'split':>9} {'jobs/sec':>9} {'peak open':>10} {'avg busy':>9}")
+    # io_job's rate is set by its sleep rather than by the queue, so its
+    # job counts are sized by hand to keep each run to several seconds.
+    for task_name, workers, slots, jobs in (
+            ("io_job", 1, 8, job_count), ("io_job", 1, 32, job_count * 2),
+            ("io_job_varied", 1, 32, job_count * 2), ("io_job", 4, 32, job_count * 4),
+            ("bench_job", 1, 8, _jobs_for(job_count, 8)),
+            ("bench_job", 4, 8, _jobs_for(job_count, 32))):
+        samples: list[tuple[int, int]] = []
+        rate = measure_throughput(
+            conn, job_count=jobs, worker_count=workers,
+            poll_interval=poll_interval, concurrency=slots, batch_size=25,
+            task_name=task_name, connections=samples,
+        )
+        split = f"{workers}w x {slots}s"
+        peak_open = max(opened for opened, _ in samples)
+        avg_busy = sum(busy for _, busy in samples) / len(samples)
+        print(f"  {task_name:>13} {split:>9} {rate:>9.0f} {peak_open:>10} {avg_busy:>9.1f}")
 
 
 def run_concurrency_suite(conn, *, job_count: int, worker_count: int,
@@ -437,40 +592,42 @@ def run_scaling_suite(conn, *, job_count: int, poll_interval: float) -> None:
         print(f"  {workers:>7}   {rate:>8.0f}   {speedup:>10.2f}x   {speedup / workers * 100:>9.0f}%")
 
 
-def run_durability_suite(conn, *, job_count: int, worker_count: int, poll_interval: float) -> None:
-    print("  ... synchronous_commit = on", flush=True)
-    durable = measure_throughput(
-        conn, job_count=job_count, worker_count=worker_count, poll_interval=poll_interval
-    )
+def run_durability_suite(conn, *, job_count: int, poll_interval: float) -> None:
+    """
+    What fsync-per-commit costs, at increasing jobs in flight.
 
-    # Relaxing fsync-per-commit puts Postgres roughly where a Redis-backed
-    # queue sits by default - the apples-to-apples setting for any
-    # cross-system comparison.
-    # Workers relaxed, enqueues still fully durable. Losing a worker's
-    # claim or completion commit in a crash is not data loss - it's a
-    # re-run, which is the at-least-once path this queue already
-    # implements. Losing an *enqueue* would be data loss, and that
-    # commit belongs to the caller's transaction, which stays durable.
-    print("  ... workers relaxed, enqueues durable", flush=True)
-    worker_relaxed = measure_throughput(
-        conn, job_count=job_count, worker_count=worker_count,
-        poll_interval=poll_interval, dsn=_relaxed_dsn(),
-    )
+    Three settings per row. Everything durable is the default. Workers
+    relaxed is run_worker(durable_bookkeeping=False): a worker's own
+    claim and completion commits stop waiting for the flush, but the
+    enqueue - the caller's commit - stays durable. Losing a worker
+    commit in a crash is a re-run, the at-least-once path this queue
+    already implements; losing an enqueue would be data loss. Nothing
+    durable relaxes the enqueue too, which is roughly where a
+    Redis-backed queue sits by default.
 
-    print("  ... synchronous_commit = off", flush=True)
-    relaxed = _measure_with_dsn(
-        _relaxed_dsn(), job_count=job_count, worker_count=worker_count,
-        poll_interval=poll_interval,
-    )
-
+    Cost is everything-durable against workers-relaxed: the price of the
+    one setting a user actually chooses between.
+    """
     print()
-    print(f"  everything durable            {durable:>8.0f} jobs/sec   (every commit fsynced)")
-    print(f"  workers relaxed               {worker_relaxed:>8.0f} jobs/sec   (enqueues still durable; "
-          "a lost worker commit is a re-run)")
-    print(f"  nothing durable               {relaxed:>8.0f} jobs/sec   (an enqueue can vanish - real data loss)")
-    print()
-    print(f"  cost of full durability       {(1 - durable / relaxed) * 100:>8.0f}%")
-    print(f"  cost of durable enqueues only {(1 - worker_relaxed / relaxed) * 100:>8.0f}%")
+    print(f"  {'in flight':>10} {'split':>9} {'durable':>9} {'workers relaxed':>16} "
+          f"{'nothing durable':>16} {'cost':>6}")
+    for workers, slots in ((1, 4), (2, 8), (4, 8), (8, 8)):
+        options = {"concurrency": slots, "batch_size": 25}
+        jobs = _jobs_for(job_count, workers * slots)
+        durable = measure_throughput(
+            conn, job_count=jobs, worker_count=workers, poll_interval=poll_interval, **options,
+        )
+        worker_relaxed = measure_throughput(
+            conn, job_count=jobs, worker_count=workers, poll_interval=poll_interval,
+            dsn=_relaxed_dsn(), **options,
+        )
+        nothing_durable = _measure_with_dsn(
+            _relaxed_dsn(), job_count=jobs, worker_count=workers,
+            poll_interval=poll_interval, **options,
+        )
+        cost = (1 - durable / worker_relaxed) * 100
+        print(f"  {workers * slots:>10} {f'{workers}w x {slots}s':>9} {durable:>9.0f} "
+              f"{worker_relaxed:>16.0f} {nothing_durable:>16.0f} {cost:>5.0f}%")
 
 
 def main() -> None:
@@ -483,13 +640,17 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--latency-samples", type=int, default=15)
     parser.add_argument("--poll-interval", type=float, default=1.0)
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="report each throughput figure as the median of this many runs")
     parser.add_argument(
         "--suite",
         choices=("main", "baseline", "scaling", "concurrency", "curve",
-                 "durability", "commitdelay", "comparison", "all"),
+                 "durability", "commitdelay", "comparison", "connections", "all"),
         default="main",
     )
     args = parser.parse_args()
+    global REPEAT
+    REPEAT = args.repeat
 
     if args.worker:
         run_worker(
@@ -521,6 +682,11 @@ def main() -> None:
                 run_curve_suite(
                     conn, job_count=args.jobs, poll_interval=args.poll_interval
                 )
+            if args.suite in ("connections", "all"):
+                print("connections: peak connections held, IO-bound vs transactional...")
+                run_connections_suite(
+                    conn, job_count=args.jobs, poll_interval=args.poll_interval
+                )
             if args.suite in ("concurrency", "all"):
                 print("concurrency: slots per worker process...")
                 run_concurrency_suite(
@@ -530,8 +696,7 @@ def main() -> None:
             if args.suite in ("durability", "all"):
                 print("durability: synchronous_commit on vs off...")
                 run_durability_suite(
-                    conn, job_count=args.jobs, worker_count=args.workers,
-                    poll_interval=args.poll_interval,
+                    conn, job_count=args.jobs, poll_interval=args.poll_interval,
                 )
             if args.suite in ("commitdelay", "all"):
                 print("commit_delay: group-commit tuning, durability unchanged...")

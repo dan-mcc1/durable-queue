@@ -41,6 +41,15 @@ run N concurrent slots per worker. Correctness comes first; concurrency
 slots are a later, clean incremental addition (see stretch, M11+) rather
 than a thing that complicates every earlier milestone.
 
+**Update, after M8:** that is how it played out. Once the chaos tests were
+passing, concurrency slots went in as planned: `run_worker(concurrency=N)`
+runs N slot threads per process, sharing one claim loop and one heartbeat
+thread. Leases stayed per job, so the recovery model didn't change at all,
+which is the payoff of getting correctness right first. Benchmarks then
+showed that throughput depends on total jobs in flight, not on how they're
+split between processes and threads, and that slots need far fewer
+connections (see the README).
+
 ### Deliverables
 
 The library repo, a CLI, a chaos test suite, a README with before/after
@@ -214,6 +223,15 @@ system — stopping early still means stopping with something real.
   independent defenses are used instead of one, and that a session-scoped
   advisory lock releasing automatically when the connection dies is the
   feature, not a limitation.
+
+  **Update, later:** leader election was then removed. Locking due schedules
+  `FOR UPDATE SKIP LOCKED` in the same transaction as their enqueues makes
+  concurrent schedulers safe, which is the same move the job claim already
+  makes. That also fixed two things the advisory lock couldn't handle: a
+  leader that hung while its connection stayed open froze every schedule,
+  and a session-scoped lock doesn't survive a transaction-pooling
+  PgBouncer. Two defenses still stand: the row locks, and the idempotency
+  key as a backstop.
 
 ### Week 3 — a queue you can operate
 

@@ -3,11 +3,15 @@ import queue
 import socket
 import threading
 import uuid
+from contextlib import nullcontext
 from time import monotonic, sleep
+from typing import ContextManager
 
 import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
-from durable_queue.db import get_connection
+from durable_queue.db import get_connection, get_dsn
 from durable_queue.jobs import (
     DEFAULT_LEASE_SECONDS,
     JOB_NOTIFY_CHANNEL,
@@ -20,7 +24,7 @@ from durable_queue.jobs import (
     reap_expired_jobs,
 )
 
-from durable_queue.registry import get_registered_task
+from durable_queue.registry import PermanentError, get_registered_task
 
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_MAX_EXECUTION_SECONDS = 300
@@ -153,8 +157,18 @@ class _Heartbeat:
             extend_leases(self._conn, live, self._worker_id, self._lease_seconds)
 
 
+def _borrow(source: "psycopg.Connection | ConnectionPool") -> ContextManager[psycopg.Connection]:
+    """
+    A connection for one piece of database work: borrowed from the pool
+    and returned when the block ends, or a plain connection as-is.
+    """
+    if isinstance(source, ConnectionPool):
+        return source.connection()
+    return nullcontext(source)
+
+
 def run_job(
-        conn: psycopg.Connection,
+        conn: "psycopg.Connection | ConnectionPool",
         job: dict,
         worker_id: str,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
@@ -162,6 +176,14 @@ def run_job(
         heartbeat: "_Heartbeat | None" = None) -> None:
     """
     Run one already-claimed job and record its outcome.
+
+    conn may be a pool, which is how run_worker's slots call this: a
+    connection is then borrowed only for each piece of database work -
+    the whole run for a transactional task, which needs it throughout,
+    but only the completion write for any other task. Those spend their
+    time waiting on things that aren't Postgres, and holding a
+    connection through that wait is what made connections scale with
+    slots rather than with database work.
 
     Pass the worker's heartbeat to reuse it; without one, a temporary
     heartbeat and connection are created for the duration of this job.
@@ -180,28 +202,45 @@ def run_job(
         heartbeat = _Heartbeat(heartbeat_conn, worker_id, lease_seconds, lease_seconds / 3)
         heartbeat.start()
 
-    # Starts this job's execution clock; it was held without a deadline
-    # while it waited its turn in the worker's buffer.
-    heartbeat.hold([job["id"]], max_execution_seconds)
-
+    registered = None
     try:
         registered = get_registered_task(job["task"])
+
+        # Starts this job's execution clock; it was held without a
+        # deadline while it waited its turn in the worker's buffer.
+        if registered.max_execution_seconds is not None:
+            max_execution_seconds = registered.max_execution_seconds
+        heartbeat.hold([job["id"]], max_execution_seconds)
+
         if registered.wants_connection:
             # Exactly-once, not at-least-once: the task's writes and the
             # job's completion land in one commit, so a crash can't
             # leave the work done but unrecorded (or vice versa). Only
             # possible because nothing here leaves the database.
-            with conn.transaction():
-                registered.fn(conn=conn, **job["args"])
-                if not mark_succeeded_in_transaction(conn, job["id"], worker_id):
+            with _borrow(conn) as task_conn, task_conn.transaction():
+                registered.fn(conn=task_conn, **job["args"])
+                if not mark_succeeded_in_transaction(task_conn, job["id"], worker_id):
                     raise _LeaseLost
         else:
             registered.fn(**job["args"])
-            mark_succeeded(conn, job["id"], worker_id)
+            with _borrow(conn) as done_conn:
+                mark_succeeded(done_conn, job["id"], worker_id)
     except _LeaseLost:
         pass  # another worker owns it now; their run is the one that counts
     except Exception as exc:
-        mark_failed(conn, job["id"], worker_id, str(exc))
+        # registered is None only if the lookup itself failed - a worker
+        # missing the task, typically mid-deploy. That one retries with
+        # the defaults: a worker that has the task may claim it next.
+        #
+        # Borrowed afresh rather than reusing the connection above: if
+        # that one broke, the pool has discarded it, so recording the
+        # failure doesn't fail too.
+        with _borrow(conn) as failed_conn:
+            mark_failed(
+                failed_conn, job["id"], worker_id, str(exc),
+                permanent=isinstance(exc, PermanentError),
+                max_attempts=registered.max_attempts if registered else None,
+            )
     finally:
         heartbeat.release([job["id"]])
         if owns_heartbeat:
@@ -273,9 +312,14 @@ def run_worker(
     than async, because task functions are ordinary blocking Python and
     the GIL is released while they wait on IO.
 
-    Each slot gets its own connection, since a psycopg connection can't
-    be shared between threads, so a process holds concurrency + 2
-    connections in total.
+    Connections: two of the process's own (claiming and heartbeat), plus
+    whatever the slots' pool has open - never more than concurrency.
+    Slots borrow from it for each piece of database work rather than
+    each owning a connection, which they used to hold idle through
+    every HTTP call. For tasks that don't take `conn`, far fewer are in
+    use at any moment, but the pool keeps what a burst made it open for
+    10 idle minutes, so budget max_connections for concurrency + 2
+    regardless. See run_job.
     """
     conn = get_connection()
     heartbeat_conn = get_connection()
@@ -311,29 +355,37 @@ def run_worker(
     outstanding = 0  # claimed but not yet finished: queued + running
     capacity = threading.Condition()
 
+    # A slot borrows at most one connection at a time, so concurrency is
+    # enough for every slot to be mid-transaction at once and no slot
+    # ever waits on a connection another is holding - at most on one
+    # being opened. It only grows that far if slots really are using
+    # them together: the pool starts at one and opens another only when
+    # a borrower would otherwise have to wait.
+    slot_pool = ConnectionPool(
+        get_dsn(),
+        kwargs={"row_factory": dict_row, "autocommit": True},
+        configure=None if durable_bookkeeping else relax_bookkeeping_durability,
+        min_size=1,
+        max_size=concurrency,
+        open=True,
+    )
+
     def slot() -> None:
         nonlocal outstanding
-        slot_conn = get_connection()
-        slot_conn.autocommit = True
-        if not durable_bookkeeping:
-            relax_bookkeeping_durability(slot_conn)
-        try:
-            while True:
-                job = ready.get()
-                try:
-                    if job is None:
-                        return
-                    run_job(
-                        slot_conn, job, worker_id, lease_seconds,
-                        max_execution_seconds, heartbeat,
-                    )
-                finally:
-                    with capacity:
-                        outstanding -= 1
-                        capacity.notify()
-                    ready.task_done()
-        finally:
-            slot_conn.close()
+        while True:
+            job = ready.get()
+            try:
+                if job is None:
+                    return
+                run_job(
+                    slot_pool, job, worker_id, lease_seconds,
+                    max_execution_seconds, heartbeat,
+                )
+            finally:
+                with capacity:
+                    outstanding -= 1
+                    capacity.notify()
+                ready.task_done()
 
     for _ in range(concurrency):
         threading.Thread(target=slot, daemon=True).start()

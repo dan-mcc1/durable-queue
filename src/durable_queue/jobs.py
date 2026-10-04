@@ -111,11 +111,12 @@ def claim_jobs(
 
     Claiming one job at a time costs a round trip per job (measured at
     ~1.7ms against a local database, against ~0.1ms per job when
-    claiming ten). The worker still *runs* one job at a time - only the
-    claim is batched - so the "one job per worker" model is unchanged.
+    claiming ten). How many jobs are claimed at once is independent of
+    how many run at once: run_worker buffers the batch and its
+    concurrency slots pull from that buffer.
 
-    What does change: a worker holds every claimed lease until it works
-    through the batch, so a crash returns the whole batch to the reaper
+    The cost: a worker holds every claimed lease until it works through
+    the batch, so a crash returns the whole batch to the reaper
     rather than a single job, and the heartbeat has to keep every held
     lease alive, not just the running one.
     """
@@ -269,16 +270,23 @@ def mark_succeeded_in_transaction(conn: psycopg.Connection, job_id: int, worker_
     it inside its own transaction - specifically a transactional task,
     whose writes have to land in the same commit as the job's
     completion. Returns whether this worker still held the job.
+
+    Answered with RETURNING rather than rowcount so it stays right on a
+    connection in pipeline mode, where rowcount reads -1 until the
+    pipeline syncs - which would report every job as lost and roll back
+    the task's work. fetchone() forces the sync. (Pipelining the
+    completion was tried and dropped; see the README.)
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE jobs SET status = 'succeeded', finished_at = now()
             WHERE id = %s AND locked_by = %s AND status = 'running'
+            RETURNING id
             """,
             (job_id, worker_id),
         )
-        return cur.rowcount > 0
+        return cur.fetchone() is not None
 
 
 def mark_succeeded(conn: psycopg.Connection, job_id: int, worker_id: str) -> bool:
@@ -310,33 +318,50 @@ def compute_backoff(attempts: int, *, base_seconds: float = 1.0, max_seconds: fl
     return random.uniform(0, upper_bound)
 
 
-def mark_failed(conn: psycopg.Connection, job_id: int, worker_id: str, error: str) -> bool:
+def mark_failed(
+        conn: psycopg.Connection,
+        job_id: int,
+        worker_id: str,
+        error: str,
+        *,
+        permanent: bool = False,
+        max_attempts: int | None = None) -> bool:
     """
     Record a failure. Reschedules to 'pending' with a backed-off run_at
     if attempts remain, otherwise flips to 'dead'. Either way the job's
     lease is released (locked_by/locked_until cleared) since it's no
     longer owned by a running worker.
 
+    permanent=True dead-letters it regardless of attempts left - the
+    task said retrying can't help. max_attempts, when given, is the
+    task's own limit; it's written to the row rather than only compared
+    against, so `durable-queue show` reports the limit actually applied.
+
     Guarded by locked_by like mark_succeeded: a worker whose lease
     lapsed must not reschedule a job that another worker has already
     reclaimed and is actively running - that would hand the same job
     out a third time. Returns whether this worker still held the job.
+
+    The two UPDATEs share one explicit transaction. Workers run in
+    autocommit, where each statement would otherwise commit on its own
+    and release the row lock between them - and only the first is
+    guarded by locked_by. A reaper sweep landing in that gap (a job past
+    its execution ceiling has an expired lease) could hand the job to
+    another worker, and the second UPDATE would then overwrite that
+    worker's run. Holding the lock throughout makes the sweep skip it.
     """
-    with conn.cursor() as cur:
+    with conn.transaction(), conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE jobs SET attempts = attempts + 1
+            UPDATE jobs
+            SET attempts = attempts + 1, max_attempts = COALESCE(%s, max_attempts)
             WHERE id = %s AND locked_by = %s AND status = 'running'
             RETURNING attempts, max_attempts
             """,
-            (job_id, worker_id),
+            (max_attempts, job_id, worker_id),
         )
         row = cur.fetchone()
-        if row is None:
-            conn.commit()
-            return False
-
-        if row["attempts"] >= row["max_attempts"]:
+        if row is not None and (permanent or row["attempts"] >= row["max_attempts"]):
             cur.execute(
                 """
                 UPDATE jobs
@@ -346,7 +371,7 @@ def mark_failed(conn: psycopg.Connection, job_id: int, worker_id: str, error: st
                 """,
                 (error, job_id),
             )
-        else:
+        elif row is not None:
             delay = compute_backoff(row["attempts"])
             cur.execute(
                 """
@@ -357,8 +382,11 @@ def mark_failed(conn: psycopg.Connection, job_id: int, worker_id: str, error: st
                 """,
                 (timedelta(seconds=delay), error, job_id),
             )
+    # If the caller already had a transaction open, transaction() above
+    # was only a savepoint inside it, so this is still what commits.
+    # (A no-op under autocommit.)
     conn.commit()
-    return True
+    return row is not None
 
 
 def delete_completed_jobs(

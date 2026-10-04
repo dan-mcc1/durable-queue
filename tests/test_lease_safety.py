@@ -1,11 +1,13 @@
 """
 Regression tests for lease-ownership and lease-lifetime bugs: a worker
-writing terminal status over a job it no longer owns, a hung task
+writing terminal status over a job it no longer owns, a reaper sweep
+splitting mark_failed's two writes, a hung task
 holding its lease forever, a job that repeatedly kills its worker
 retrying forever, and claim_next_job leaving an open transaction.
 """
 from time import sleep
 
+from durable_queue import jobs
 from durable_queue.db import get_connection
 from durable_queue.jobs import (
     claim_jobs,
@@ -64,6 +66,43 @@ def test_mark_failed_refuses_a_job_this_worker_no_longer_owns(conn, worker_id):
     assert job["status"] == "running"
     assert job["attempts"] == 0
     assert job["last_error"] is None
+
+
+def test_mark_failed_holds_the_job_against_a_sweep_between_its_updates(conn, worker_id, monkeypatch):
+    """
+    mark_failed is two UPDATEs, and workers run in autocommit. As two
+    separate commits, a reaper sweep could land between them - a job
+    past its execution ceiling has an expired lease - and hand the job
+    to another worker, whose run the second UPDATE would then overwrite.
+    compute_backoff runs in exactly that gap, so it stands in for the
+    badly timed sweep.
+    """
+    job_id = enqueue(conn, "some_task", {})
+    conn.commit()
+    claim_next_job(conn, worker_id, lease_seconds=-1)  # lease already expired
+
+    worker_conn = get_connection()
+    worker_conn.autocommit = True  # as run_worker's slots are
+    rival_conn = get_connection()
+    rival_claims = []
+
+    def sweep_in_the_gap(attempts: int) -> float:
+        reap_expired_jobs(rival_conn)
+        rival_claims.append(claim_next_job(rival_conn, "rival-worker"))
+        return 0.0
+
+    monkeypatch.setattr(jobs, "compute_backoff", sweep_in_the_gap)
+    try:
+        assert mark_failed(worker_conn, job_id, worker_id, "boom") is True
+    finally:
+        worker_conn.close()
+        rival_conn.close()
+
+    assert rival_claims == [None]
+    job = get_job(conn, job_id)
+    assert job["status"] == "pending"
+    assert job["attempts"] == 1
+    assert job["recoveries"] == 0  # the sweep skipped the locked row
 
 
 def test_heartbeat_stops_extending_a_job_past_its_execution_ceiling(conn, worker_id):

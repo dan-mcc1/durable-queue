@@ -7,11 +7,6 @@ from psycopg.types.json import Jsonb
 from durable_queue.db import get_connection
 from durable_queue.jobs import enqueue
 
-# An arbitrary fixed key identifying "the durable-queue scheduler" as a
-# single named lock. Any stable int64 works here; this number carries no
-# other meaning.
-SCHEDULER_LOCK_KEY = 727274
-
 
 def register_schedule(
         conn: psycopg.Connection,
@@ -40,66 +35,72 @@ def register_schedule(
     conn.commit()
 
 
-def try_acquire_leadership(conn: psycopg.Connection) -> bool:
-    """
-    Attempt to become the scheduler leader. Non-blocking: returns
-    immediately with True/False rather than waiting for the lock.
-
-    This is a session-scoped advisory lock - Postgres releases it
-    automatically if this connection dies, crashes, or closes, with no
-    manual cleanup required. That's deliberate, not a limitation: it's
-    what lets a second scheduler instance take over the instant the
-    leader disappears, without a heartbeat or lease of its own.
-    """
-    with conn.cursor() as cur:
-        cur.execute("SELECT pg_try_advisory_lock(%s)", (SCHEDULER_LOCK_KEY,))
-        return cur.fetchone()["pg_try_advisory_lock"]
-
-
 def run_due_schedules(conn: psycopg.Connection) -> int:
     """
     Enqueue a job for every schedule whose next_run_at has passed, then
     advance next_run_at by its interval. Returns the count fired.
 
+    Safe to run from any number of schedulers at once, so there is no
+    leader. Due schedules are locked FOR UPDATE SKIP LOCKED - the same
+    move as claiming a job - and held until the enqueues and the
+    advanced next_run_at commit together. A concurrent scheduler skips
+    whatever this one holds, and by the time the locks release those
+    schedules are no longer due. A scheduler that crashes mid-run rolls
+    back and releases its locks, so the next one simply fires them.
+
+    This replaced pg_try_advisory_lock leader election, and is better
+    in two ways besides being less code. A leader that hung while
+    keeping its connection open held the lock forever, and nothing
+    fired; here a hung scheduler only stalls the schedules it has
+    locked. And a session-scoped advisory lock needs a stable session,
+    which a transaction-pooling PgBouncer doesn't provide; row locks
+    live inside the transaction and work through it.
+
     The idempotency key is built from the schedule's own stored
     next_run_at, not from now(). That value is persisted and doesn't
     change until this function advances it, so it can't drift the way a
     freshly computed "truncate now() to the hour" could across a
-    restart. This is the backstop defense: even if this function were
-    interrupted after enqueueing but before advancing next_run_at, the
-    next attempt would recompute the identical key, and enqueue() would
-    just return the already-existing job's id instead of creating a
-    second one.
+    restart. It is the backstop for what the locks can't see: if
+    next_run_at is ever wound back to a slot that already fired (a
+    restore from backup, a hand edit), firing it again recomputes the
+    identical key, and enqueue() returns the existing job instead of
+    creating a second one.
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT name, task, args, interval_seconds, next_run_at FROM schedules WHERE next_run_at <= now()"
-        )
-        due = cur.fetchall()
-
-    for row in due:
-        idempotency_key = f"sched:{row['name']}:{row['next_run_at'].isoformat()}"
-        enqueue(conn, row["task"], row["args"], idempotency_key=idempotency_key)
-
-        next_run_at = row["next_run_at"] + timedelta(seconds=row["interval_seconds"])
+    # Explicit, because the locks are only worth anything if they are
+    # held until the commit - on an autocommit connection the SELECT
+    # would release them the moment it finished.
+    with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE schedules SET next_run_at = %s WHERE name = %s",
-                (next_run_at, row["name"]),
+                """
+                SELECT name, task, args, interval_seconds, next_run_at FROM schedules
+                WHERE next_run_at <= now()
+                FOR UPDATE SKIP LOCKED
+                """
             )
+            due = cur.fetchall()
 
+        for row in due:
+            idempotency_key = f"sched:{row['name']}:{row['next_run_at'].isoformat()}"
+            enqueue(conn, row["task"], row["args"], idempotency_key=idempotency_key)
+
+            next_run_at = row["next_run_at"] + timedelta(seconds=row["interval_seconds"])
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE schedules SET next_run_at = %s WHERE name = %s",
+                    (next_run_at, row["name"]),
+                )
+
+    # If the caller already had a transaction open, transaction() above
+    # was only a savepoint inside it, so this is still what commits.
     conn.commit()
     return len(due)
 
 
 def run_scheduler(poll_interval: float = 1.0) -> None:
     conn = get_connection()
-    is_leader = False
     while True:
-        if not is_leader:
-            is_leader = try_acquire_leadership(conn)
-        if is_leader:
-            run_due_schedules(conn)
+        run_due_schedules(conn)
         sleep(poll_interval)
 
 
