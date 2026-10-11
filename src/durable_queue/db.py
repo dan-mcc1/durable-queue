@@ -23,6 +23,8 @@ _CONNECTION_DEFAULTS = {
     # The case keepalives miss: a query sent into a dead connection,
     # where unacknowledged data stops probes being sent at all.
     "tcp_user_timeout": 60_000,
+    # So the queue's sessions can be told apart in pg_stat_activity.
+    "application_name": "durable-queue",
 }
 
 

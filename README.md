@@ -48,7 +48,7 @@ subprocesses mid-job, at random, with no cleanup opportunity:
 | **Retries**         | Exponential backoff with full jitter; `PermanentError` dead-letters at once; per-task `@task(max_attempts=...)`; poison pills that crash their worker are dead-lettered by recovery count |
 | **Idempotency**     | Enqueue-time dedup via `idempotency_key`, effect-time dedup via an effects ledger, and true atomicity for transactional tasks |
 | **Low latency**     | `LISTEN/NOTIFY` wakes an idle worker on enqueue, with polling retained as the backstop for retries and schedules              |
-| **Scheduling**      | Leaderless: due schedules are locked `FOR UPDATE SKIP LOCKED`, so any number of schedulers can run, plus a per-run idempotency backstop |
+| **Scheduling**      | Intervals or clock times in a time zone; missed runs collapse to one. Leaderless: due schedules are locked `FOR UPDATE SKIP LOCKED`, so any number of schedulers can run, plus a per-run idempotency backstop |
 | **Connections**     | Slots borrow from a per-process pool only for database work, so steady-state connections follow database work, not slot count; dropped connections are reopened on next use |
 | **Observability**   | `durable-queue ls / show / retry / dead / stats`                                                                              |
 | **Chaos tests**     | Real worker subprocesses killed mid-job, asserting invariants across many jobs and many kills                                 |
@@ -368,6 +368,23 @@ workers × 8 slots is 80 against Postgres's default `max_connections` of 100.
 Run as many schedulers as you like; they coordinate through row locks, so
 there's no leader to lose.
 
+Schedules run every N seconds or on the clock, and registering on every
+startup is safe:
+
+```python
+from durable_queue.scheduler import daily, hourly, register_schedule
+
+register_schedule(conn, "digest", "send_digests", {}, hourly(minute=0))
+register_schedule(conn, "stripe", "reconcile_stripe", {}, daily("04:00", "America/New_York"))
+register_schedule(conn, "streaming", "refresh_streaming", {},
+                  daily("11:00", "America/New_York"), max_lateness_seconds=3600)
+```
+
+`daily` follows the local clock through daylight saving changes. A schedule
+that missed runs while nothing was scheduling runs once, for the most recent,
+instead of once per missed run back to back. `max_lateness_seconds` skips
+even that one when it's too late to be useful.
+
 Task options: raise `PermanentError` for a failure no retry can fix, and use
 `@task(max_attempts=3, max_execution_seconds=60)` to override the defaults
 for one task. `max_execution_seconds` is a lease ceiling, not a timeout:
@@ -409,10 +426,34 @@ db.commit()  # both land, or neither does
 
 `enqueue_many` is there too. Workers still use psycopg 3.
 
+### Inside your app, on a database that scales to zero
+
+A worker that polls keeps a database like Neon awake, and billing, around the
+clock. In idle mode it doesn't poll: it works out when a job next needs it (a
+schedule, a retry, a lease to recover) and sleeps until then without sending a
+query, closing its connections first if that's more than a minute off. The
+database sleeps too. `Runner` puts a worker and scheduler in idle mode on
+background threads of your app:
+
+```python
+from durable_queue.runner import Runner
+
+runner = Runner(concurrency=4)
+
+@asynccontextmanager
+async def lifespan(app):
+    runner.start()
+    yield
+    await asyncio.to_thread(runner.stop)  # unstarted jobs go back, running ones finish
+```
+
+Besides its own due times, it wakes when this process creates work: a schedule
+firing, a retry, an enqueue through `durable_queue.sqlalchemy` once it
+commits. An enqueue from another process waits for its next wake, since
+`LISTEN` is off in idle mode.
+
 ## Known gaps
 
-No graceful shutdown on SIGTERM, no structured logging, no real migrations,
-and no `durable-queue worker` / `scheduler` CLI entry points. Schedules are
-interval-only, and fire every missed run back to back after an outage. A
-worker and scheduler poll every second, which keeps a database that scales to
-zero, such as Neon, awake around the clock. 104 tests passing.
+No structured logging, no real migrations, and no `durable-queue worker` /
+`scheduler` CLI entry points. `stop=` and `Runner.stop()` shut down gracefully,
+but `python -m durable_queue.worker` doesn't yet turn SIGTERM into one.

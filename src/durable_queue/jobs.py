@@ -283,6 +283,56 @@ def reap_expired_jobs(conn: psycopg.Connection, reap_batch: int = DEFAULT_REAP_B
     return dead_lettered + recovered
 
 
+def seconds_until_due(conn: psycopg.Connection) -> float | None:
+    """
+    How long until a job needs a worker: a pending job's run_at - a
+    retry waiting out its backoff - or a running job's lease expiring,
+    when it may need recovering. None if there are no jobs in either
+    state. Negative if one is already overdue.
+
+    What an idle worker sleeps until. Both halves read their own partial
+    index, so it costs about what a claim does.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT extract(epoch FROM least(
+                (SELECT min(run_at) FROM jobs WHERE status = 'pending'),
+                (SELECT min(locked_until) FROM jobs WHERE status = 'running')
+            ) - now()) AS seconds
+            """
+        )
+        seconds = cur.fetchone()["seconds"]
+    conn.commit()  # as in claim_jobs: never sit idle in a transaction
+    return None if seconds is None else float(seconds)
+
+
+def release_jobs(conn: psycopg.Connection, job_ids: list[int], worker_id: str) -> int:
+    """
+    Hand claimed jobs back to the queue unrun, for a worker shutting
+    down with jobs it claimed but never started. Returns how many it
+    still held.
+
+    Better than leaving them to the reaper, which would make them wait
+    out their leases, and would count a recovery against each - their
+    worker didn't die on them. Guarded by locked_by like every other
+    write to a lease.
+    """
+    if not job_ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs SET status = 'pending', locked_by = NULL, locked_until = NULL
+            WHERE id = ANY(%s) AND locked_by = %s AND status = 'running'
+            """,
+            (job_ids, worker_id),
+        )
+        released = cur.rowcount
+    conn.commit()
+    return released
+
+
 def mark_succeeded_in_transaction(conn: psycopg.Connection, job_id: int, worker_id: str) -> bool:
     """
     The mark_succeeded UPDATE without the commit, for a caller running

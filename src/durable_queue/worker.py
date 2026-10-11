@@ -5,13 +5,14 @@ import socket
 import threading
 import uuid
 from contextlib import nullcontext
-from time import monotonic, sleep
+from time import monotonic
 from typing import ContextManager
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from durable_queue import wakeup
 from durable_queue.db import (
     RECONNECT_MAX_DELAY,
     RECONNECT_MIN_DELAY,
@@ -29,6 +30,8 @@ from durable_queue.jobs import (
     mark_succeeded,
     mark_succeeded_in_transaction,
     reap_expired_jobs,
+    release_jobs,
+    seconds_until_due,
 )
 
 from durable_queue.registry import PermanentError, get_registered_task
@@ -113,11 +116,12 @@ class _Heartbeat:
     """
 
     def __init__(self, conn: ReconnectingConnection, worker_id: str,
-                 lease_seconds: int, interval: float) -> None:
+                 lease_seconds: int, interval: float, *, close_when_idle: bool = False) -> None:
         self._conn = conn
         self._worker_id = worker_id
         self._lease_seconds = lease_seconds
         self._interval = interval
+        self._close_when_idle = close_when_idle
         self._deadlines: dict[int, float | None] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -164,7 +168,12 @@ class _Heartbeat:
                     if deadline is None or now < deadline
                 ]
             if not live:
-                continue  # don't open a connection only to do nothing with it
+                # Don't open a connection only to do nothing with it. In
+                # idle mode, let go of an open one too, since the worker
+                # may be about to sleep for hours.
+                if self._close_when_idle:
+                    self._conn.close()
+                continue
             try:
                 extend_leases(self._conn.get(), live, self._worker_id, self._lease_seconds)
             except Exception:
@@ -265,6 +274,9 @@ def run_job(
                 permanent=isinstance(exc, PermanentError),
                 max_attempts=registered.max_attempts if registered else None,
             )
+        # A retry is new work with a time on it, which an idle worker
+        # asleep until something later would otherwise sleep through.
+        wakeup.wake()
     finally:
         heartbeat.release([job["id"]])
         if owns_heartbeat:
@@ -308,7 +320,10 @@ def run_worker(
         batch_size: int = DEFAULT_BATCH_SIZE,
         concurrency: int = 1,
         dsn: str | None = None,
-        check_connections: bool = True) -> None:
+        check_connections: bool = True,
+        idle: bool = False,
+        stop: threading.Event | None = None,
+        shutdown_timeout: float = 30.0) -> None:
     """
     use_notify=False falls back to pure polling. Correctness is
     identical either way - only idle-to-start latency differs, since
@@ -358,9 +373,33 @@ def run_worker(
     lent to a job, which fails and spends an attempt, or runs twice if
     the task had already finished. Only turn it off where connections
     never drop behind the worker's back.
+
+    idle=True is for a database that scales to zero, such as Neon, which
+    any polling keeps awake. Instead of polling, the worker works out
+    when a job next needs it - a retry's run_at, a lease to recover -
+    and sleeps until then without a query, closing its connections first
+    if that's more than a minute off. Anything else that should wake it
+    has to happen in this process and call wakeup.wake(), as a schedule
+    firing on run_scheduler(idle=True) does, and an enqueue through
+    durable_queue.sqlalchemy once it commits. An enqueue from another
+    process waits for the next wake. LISTEN is off: the database would
+    close its connection while asleep anyway. Runner sets all of this
+    up.
+
+    stop, once set, ends the worker. It stops claiming, hands back jobs
+    it claimed but hadn't started, and gives running ones
+    shutdown_timeout seconds to finish; any still running after that are
+    left to lapse and be recovered elsewhere. Call wakeup.wake() after
+    setting it, or an idle worker sleeps on until something else wakes
+    it.
     """
     dsn = dsn or get_dsn()
     worker_id = generate_worker_id()
+    if idle:
+        use_notify = False
+
+    def stopping() -> bool:
+        return stop is not None and stop.is_set()
 
     def set_up_claim_conn(conn: psycopg.Connection) -> None:
         # The claim is a single statement that doesn't need a
@@ -386,7 +425,9 @@ def run_worker(
     if reap_interval is None:
         reap_interval = max(1.0, lease_seconds / 4)
 
-    heartbeat = _Heartbeat(heartbeat_conn, worker_id, lease_seconds, lease_seconds / 3)
+    heartbeat = _Heartbeat(
+        heartbeat_conn, worker_id, lease_seconds, lease_seconds / 3, close_when_idle=idle,
+    )
     heartbeat.start()
 
     # Never claim fewer jobs than there are slots to run them in, or
@@ -401,21 +442,27 @@ def run_worker(
     outstanding = 0  # claimed but not yet finished: queued + running
     capacity = threading.Condition()
 
-    # A slot borrows at most one connection at a time, so concurrency is
-    # enough for every slot to be mid-transaction at once and no slot
-    # ever waits on a connection another is holding - at most on one
-    # being opened. It only grows that far if slots really are using
-    # them together: the pool starts at one and opens another only when
-    # a borrower would otherwise have to wait.
-    slot_pool = ConnectionPool(
-        dsn,
-        kwargs={"row_factory": dict_row, "autocommit": True, **connection_kwargs(dsn)},
-        configure=None if durable_bookkeeping else relax_bookkeeping_durability,
-        check=ConnectionPool.check_connection if check_connections else None,
-        min_size=1,
-        max_size=concurrency,
-        open=True,
-    )
+    def open_slot_pool() -> ConnectionPool:
+        # A slot borrows at most one connection at a time, so
+        # concurrency is enough for every slot to be mid-transaction at
+        # once and no slot ever waits on a connection another is
+        # holding - at most on one being opened. It only grows that far
+        # if slots really are using them together: the pool starts at
+        # one and opens another only when a borrower would otherwise
+        # have to wait.
+        return ConnectionPool(
+            dsn,
+            kwargs={"row_factory": dict_row, "autocommit": True, **connection_kwargs(dsn)},
+            configure=None if durable_bookkeeping else relax_bookkeeping_durability,
+            check=ConnectionPool.check_connection if check_connections else None,
+            min_size=1,
+            max_size=concurrency,
+            open=True,
+        )
+
+    # In idle mode, opened when there's work and closed again before a
+    # long sleep.
+    slot_pool: ConnectionPool | None = None if idle else open_slot_pool()
 
     def slot() -> None:
         nonlocal outstanding
@@ -444,24 +491,37 @@ def run_worker(
             finally:
                 with capacity:
                     outstanding -= 1
+                    finished_last = outstanding == 0
                     capacity.notify()
                 ready.task_done()
+                if idle and finished_last and job is not None:
+                    # The end of a burst. An idle worker sleeps until its
+                    # running jobs' leases would lapse, so it has to be
+                    # told it can go back to sleeping properly now -
+                    # and let go of its connections.
+                    wakeup.wake()
 
-    for _ in range(concurrency):
-        threading.Thread(target=slot, daemon=True).start()
+    slots = [threading.Thread(target=slot, daemon=True) for _ in range(concurrency)]
+    for thread in slots:
+        thread.start()
 
     retry_delay = RECONNECT_MIN_DELAY
     next_reap_at = 0.0  # sweep immediately on startup
-    while True:
+    while not stopping():
+        # Read before looking for work, so that a wake() landing between
+        # finding none and going to sleep isn't slept through.
+        seen = wakeup.current()
         try:
             if monotonic() >= next_reap_at:
                 reap_expired_jobs(claim_conn.get())
                 next_reap_at = monotonic() + reap_interval
 
             with capacity:
-                while outstanding >= max_outstanding:
+                while outstanding >= max_outstanding and not stopping():
                     capacity.wait(timeout=0.5)
                 room = max_outstanding - outstanding
+            if stopping():
+                break
 
             batch = claim_jobs(claim_conn.get(), worker_id, lease_seconds, min(room, batch_size))
             retry_delay = RECONNECT_MIN_DELAY
@@ -473,6 +533,8 @@ def run_worker(
                 # yet: each job's clock starts when a slot actually picks
                 # it up.
                 heartbeat.hold([job["id"] for job in batch])
+                if slot_pool is None:
+                    slot_pool = open_slot_pool()
                 with capacity:
                     outstanding += len(batch)
                 for job in batch:
@@ -480,12 +542,30 @@ def run_worker(
                 continue
 
             with capacity:
-                idle = outstanding == 0
+                nothing_outstanding = outstanding == 0
             if idle:
+                seconds = seconds_until_due(claim_conn.get())
+                if seconds is not None and seconds <= 0:
+                    # Due, yet nothing to claim: an expired lease the
+                    # reaper hasn't swept yet, or a job another worker
+                    # has locked. Sweep, and look again shortly.
+                    next_reap_at = 0.0
+                timeout = None if seconds is None else max(seconds, wakeup.MIN_SLEEP)
+                if nothing_outstanding and (
+                        timeout is None or timeout > wakeup.CLOSE_CONNECTIONS_AFTER):
+                    # A long sleep: let go of every connection (the
+                    # heartbeat lets go of its own), so there's nothing
+                    # for a database scaling to zero to close under us.
+                    claim_conn.close()
+                    if slot_pool is not None:
+                        slot_pool.close()
+                        slot_pool = None
+                wakeup.wait(seen, timeout)
+            elif nothing_outstanding:
                 if use_notify:
                     wait_for_job(claim_conn.get(), poll_interval)
                 else:
-                    sleep(poll_interval)
+                    wakeup.pause(poll_interval, stop)
             else:
                 # Nothing left to claim, but slots are still working.
                 # Wait for one to finish rather than spinning on an
@@ -503,9 +583,38 @@ def run_worker(
                 worker_id, retry_delay, exc_info=True,
             )
             claim_conn.close()
-            sleep(retry_delay)
+            wakeup.pause(retry_delay, stop)
             retry_delay = min(retry_delay * 2, RECONNECT_MAX_DELAY)
 
+    # Stopping. Jobs claimed but not started go back to the queue for
+    # whoever runs next, rather than waiting out their leases.
+    unstarted = []
+    while True:
+        try:
+            unstarted.append(ready.get_nowait()["id"])
+        except queue.Empty:
+            break
+        ready.task_done()
+    if unstarted:
+        heartbeat.release(unstarted)
+        try:
+            release_jobs(claim_conn.get(), unstarted, worker_id)
+        except psycopg.OperationalError:
+            logger.warning(
+                "worker %s: could not hand back %d unstarted jobs; they're recovered"
+                " once their leases lapse", worker_id, len(unstarted), exc_info=True,
+            )
+
+    for _ in slots:
+        ready.put(None)
+    deadline = monotonic() + shutdown_timeout
+    for thread in slots:
+        thread.join(max(0.0, deadline - monotonic()))
+    heartbeat.stop()
+    if slot_pool is not None:
+        slot_pool.close()
+    claim_conn.close()
+    heartbeat_conn.close()
 
 if __name__ == "__main__":
     run_worker()

@@ -34,12 +34,21 @@ CREATE TABLE effects (
 );
 
 CREATE TABLE schedules (
-    name             text        PRIMARY KEY,
-    task             text        NOT NULL,
-    args             jsonb       NOT NULL DEFAULT '{}',
-    interval_seconds int         NOT NULL,
-    next_run_at      timestamptz NOT NULL DEFAULT now(),
-    created_at       timestamptz NOT NULL DEFAULT now()
+    name                 text        PRIMARY KEY,
+    task                 text        NOT NULL,
+    args                 jsonb       NOT NULL DEFAULT '{}',
+    -- Either every interval_seconds, or on the clock: every 'hour' at
+    -- at_time's minute (UTC), or every 'day' at at_time in time_zone.
+    interval_seconds     int,
+    every                text        CHECK (every IN ('hour', 'day')),
+    at_time              time,
+    time_zone            text,
+    max_lateness_seconds int,
+    next_run_at          timestamptz NOT NULL DEFAULT now(),
+    created_at           timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT schedules_interval_or_clock CHECK ((interval_seconds IS NULL) <> (every IS NULL)),
+    CONSTRAINT schedules_clock_complete
+        CHECK (every IS NULL OR (at_time IS NOT NULL AND time_zone IS NOT NULL))
 );
 
 -- Chaos-test side channel only: a plain (non-deduped) log of every time

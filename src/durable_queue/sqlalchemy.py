@@ -13,9 +13,35 @@ Needs SQLAlchemy 2.0: `pip install durable-queue[sqlalchemy]`.
 """
 import json
 
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
+from durable_queue import wakeup
 from durable_queue.jobs import ENQUEUE_MANY_SQL, ENQUEUE_SQL, JOB_NOTIFY_CHANNEL
+
+_ENQUEUED = "durable_queue_enqueued"
+
+
+def _wake_after_commit(session: Session) -> None:
+    """
+    Wake this process's idle worker once the session commits - not
+    before, when the job isn't visible yet and the worker would find
+    nothing and go back to sleep. A worker LISTENing hears the NOTIFY
+    instead; this is for one in idle mode, which can't.
+    """
+    session.info[_ENQUEUED] = True
+    if not event.contains(session, "after_commit", _after_commit):
+        event.listen(session, "after_commit", _after_commit)
+        event.listen(session, "after_rollback", _after_rollback)
+
+
+def _after_commit(session: Session) -> None:
+    if session.info.pop(_ENQUEUED, False):
+        wakeup.wake()
+
+
+def _after_rollback(session: Session) -> None:
+    session.info.pop(_ENQUEUED, None)
 
 
 def enqueue(
@@ -30,7 +56,8 @@ def enqueue(
 
     Nothing is committed here. session.commit() commits the job along
     with everything else, a rollback discards it, and no worker is woken
-    until that commit.
+    until that commit - a LISTENing one by the NOTIFY, an idle one in
+    this process directly.
 
     The session isn't flushed first. If it has autoflush off and the
     args need an id the database hasn't assigned yet, flush before
@@ -48,6 +75,7 @@ def enqueue(
             "channel": JOB_NOTIFY_CHANNEL,
         },
     )
+    _wake_after_commit(session)
     return result.scalar_one()
 
 
@@ -75,4 +103,5 @@ def enqueue_many(
             "channel": JOB_NOTIFY_CHANNEL,
         },
     )
+    _wake_after_commit(session)
     return list(result.scalars())

@@ -15,7 +15,7 @@ def test_concurrent_schedulers_fire_a_due_schedule_once(conn, monkeypatch):
     due schedule, before it committed - which is the worst moment, and
     must neither fire the schedule again nor block waiting for it.
     """
-    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    past = datetime.now(timezone.utc) - timedelta(minutes=90)
     register_schedule(conn, "hourly-digest", "some_task", {}, 3600, first_run_at=past)
 
     rival_conn = get_connection()
@@ -38,7 +38,8 @@ def test_concurrent_schedulers_fire_a_due_schedule_once(conn, monkeypatch):
         cur.execute("SELECT count(*) AS n FROM jobs WHERE task = %s", ("some_task",))
         assert cur.fetchone()["n"] == 1
         cur.execute("SELECT next_run_at FROM schedules WHERE name = %s", ("hourly-digest",))
-        assert cur.fetchone()["next_run_at"] == past + timedelta(seconds=3600)
+        # It ran once, for its latest slot (past + 1h), so next is the one after.
+        assert cur.fetchone()["next_run_at"] == past + timedelta(hours=2)
 
 
 def test_a_scheduler_that_dies_mid_pass_leaves_the_schedule_for_the_next(conn, monkeypatch):
@@ -108,7 +109,7 @@ def test_register_schedule_updates_definition_without_resetting_next_run_at(conn
 
 
 def test_run_due_schedules_enqueues_and_advances_next_run_at(conn):
-    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    past = datetime.now(timezone.utc) - timedelta(minutes=90)
     register_schedule(conn, "hourly-digest", "some_task", {"z": 3}, 3600, first_run_at=past)
 
     fired = run_due_schedules(conn)
@@ -122,7 +123,7 @@ def test_run_due_schedules_enqueues_and_advances_next_run_at(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT next_run_at FROM schedules WHERE name = %s", ("hourly-digest",))
         new_next_run_at = cur.fetchone()["next_run_at"]
-    assert new_next_run_at == past + timedelta(seconds=3600)
+    assert new_next_run_at == past + timedelta(hours=2)
 
 
 def test_run_due_schedules_skips_a_schedule_not_yet_due(conn):
@@ -137,11 +138,11 @@ def test_run_due_schedules_does_not_double_enqueue_if_next_run_at_is_rewound(con
     Run it once, then wind next_run_at back to the slot that already
     fired - a restore from backup, say - and run it again. Row locks
     can't help here: nothing is concurrent, the schedule simply looks
-    due again. The idempotency key is derived from next_run_at itself,
-    so the same slot recomputes the same key and enqueue() dedupes it.
-    This is the backstop behind the locks.
+    due again. The idempotency key names the slot, which follows from
+    next_run_at and the interval, so the same slot recomputes the same
+    key and enqueue() dedupes it. This is the backstop behind the locks.
     """
-    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    past = datetime.now(timezone.utc) - timedelta(minutes=90)
     register_schedule(conn, "test-sched", "some_task", {}, 3600, first_run_at=past)
 
     run_due_schedules(conn)
