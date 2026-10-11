@@ -49,7 +49,7 @@ subprocesses mid-job, at random, with no cleanup opportunity:
 | **Idempotency**     | Enqueue-time dedup via `idempotency_key`, effect-time dedup via an effects ledger, and true atomicity for transactional tasks |
 | **Low latency**     | `LISTEN/NOTIFY` wakes an idle worker on enqueue, with polling retained as the backstop for retries and schedules              |
 | **Scheduling**      | Leaderless: due schedules are locked `FOR UPDATE SKIP LOCKED`, so any number of schedulers can run, plus a per-run idempotency backstop |
-| **Connections**     | Slots borrow from a per-process pool only for database work, so steady-state connections follow database work, not slot count |
+| **Connections**     | Slots borrow from a per-process pool only for database work, so steady-state connections follow database work, not slot count; dropped connections are reopened on next use |
 | **Observability**   | `durable-queue ls / show / retry / dead / stats`                                                                              |
 | **Chaos tests**     | Real worker subprocesses killed mid-job, asserting invariants across many jobs and many kills                                 |
 
@@ -374,9 +374,45 @@ for one task. `max_execution_seconds` is a lease ceiling, not a timeout:
 Python can't kill a thread, so a task that overruns keeps running, but its
 lease lapses and the job is recovered elsewhere.
 
+### Behind a pooler, or on Neon
+
+Workers `LISTEN`, which can't work through a transaction-mode pooler such as
+PgBouncer or Neon's `-pooler` endpoint, and it fails silently there: no
+wakeups, only polling. Keep the app on the pooler and give the queue a direct
+connection with `DURABLE_QUEUE_DATABASE_URL` (falling back to `DATABASE_URL`),
+or `run_worker(dsn=...)` / `run_scheduler(dsn=...)`.
+
+Connections the server drops, as Neon does on every compute restart and scale
+to zero, are reopened on their next use, with backoff. The claim connection
+replays its `LISTEN`, a heartbeat or slot that fails to reach the database
+carries on rather than dying, and the slots' pool checks each connection
+before lending it out. Without that check, a connection that died idle in the
+pool fails the job it is lent to, spending an attempt or re-running a task
+that had already finished. It costs a round trip per borrow, and the
+benchmark tables above predate it: with it, 4×8 measured 3,497 jobs/sec
+against 4,108 without, and 1×8 measured 1,544 against 1,573 (medians of three
+interleaved runs). `check_connections=False` turns it off where connections
+never drop.
+
+### Enqueueing from SQLAlchemy
+
+An app whose ORM runs on psycopg2 can enqueue inside its own session's
+transaction (`pip install durable-queue[sqlalchemy]`):
+
+```python
+from durable_queue.sqlalchemy import enqueue
+
+db.add(entry)
+enqueue(db, "notify_friends", {"user_id": uid})
+db.commit()  # both land, or neither does
+```
+
+`enqueue_many` is there too. Workers still use psycopg 3.
+
 ## Known gaps
 
-No graceful shutdown on SIGTERM, no structured logging, no reconnect for a
-worker's own claim and heartbeat connections (a slot's pooled connection is
-replaced), no real migrations, and no `durable-queue worker` / `scheduler`
-CLI entry points. 92 tests passing.
+No graceful shutdown on SIGTERM, no structured logging, no real migrations,
+and no `durable-queue worker` / `scheduler` CLI entry points. Schedules are
+interval-only, and fire every missed run back to back after an outage. A
+worker and scheduler poll every second, which keeps a database that scales to
+zero, such as Neon, awake around the clock. 104 tests passing.

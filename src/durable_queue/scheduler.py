@@ -1,11 +1,14 @@
+import logging
 from datetime import datetime, timedelta
 from time import sleep
 
 import psycopg
 from psycopg.types.json import Jsonb
 
-from durable_queue.db import get_connection
+from durable_queue.db import RECONNECT_MAX_DELAY, RECONNECT_MIN_DELAY, ReconnectingConnection
 from durable_queue.jobs import enqueue
+
+logger = logging.getLogger(__name__)
 
 
 def register_schedule(
@@ -97,10 +100,28 @@ def run_due_schedules(conn: psycopg.Connection) -> int:
     return len(due)
 
 
-def run_scheduler(poll_interval: float = 1.0) -> None:
-    conn = get_connection()
+def run_scheduler(poll_interval: float = 1.0, dsn: str | None = None) -> None:
+    """
+    A connection that drops is reopened on its next use, after a
+    backoff. A pass it interrupts is safe to repeat: it never committed,
+    so its enqueues rolled back with it and its locks were released.
+    """
+    conn = ReconnectingConnection(dsn)
+    conn.get()  # fail at startup on a bad DSN, not retry it forever
+    retry_delay = RECONNECT_MIN_DELAY
     while True:
-        run_due_schedules(conn)
+        try:
+            run_due_schedules(conn.get())
+        except psycopg.OperationalError:
+            logger.warning(
+                "scheduler: lost its database connection, retrying in %.0fs",
+                retry_delay, exc_info=True,
+            )
+            conn.close()
+            sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, RECONNECT_MAX_DELAY)
+            continue
+        retry_delay = RECONNECT_MIN_DELAY
         sleep(poll_interval)
 
 

@@ -8,7 +8,7 @@ retrying forever, and claim_next_job leaving an open transaction.
 from time import sleep
 
 from durable_queue import jobs
-from durable_queue.db import get_connection
+from durable_queue.db import ReconnectingConnection, get_connection
 from durable_queue.jobs import (
     claim_jobs,
     claim_next_job,
@@ -117,7 +117,7 @@ def test_heartbeat_stops_extending_a_job_past_its_execution_ceiling(conn, worker
     conn.commit()
     claim_jobs(conn, worker_id, lease_seconds=60, batch_size=2)
 
-    heartbeat_conn = get_connection()
+    heartbeat_conn = ReconnectingConnection()
     heartbeat = _Heartbeat(heartbeat_conn, worker_id, lease_seconds=60, interval=0.05)
     heartbeat.start()
     try:

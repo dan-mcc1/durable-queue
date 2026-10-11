@@ -10,6 +10,31 @@ DEFAULT_LEASE_SECONDS = 30
 # immediately instead of it waiting out a poll interval.
 JOB_NOTIFY_CHANNEL = "durable_queue_jobs"
 
+# The enqueue statements are shared with durable_queue.sqlalchemy, which
+# runs them through a SQLAlchemy session's driver - psycopg2, typically.
+# Hence named placeholders, which psycopg2 accepts too, and the casts:
+# args arrive as Jsonb from here but as JSON text from there.
+ENQUEUE_SQL = """
+    WITH inserted AS (
+        INSERT INTO jobs (task, args, idempotency_key)
+        VALUES (%(task)s, %(args)s::jsonb, %(idempotency_key)s)
+        ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+        RETURNING id
+    )
+    SELECT id, pg_notify(%(channel)s, '') FROM inserted
+"""
+
+ENQUEUE_MANY_SQL = """
+    WITH inserted AS (
+        INSERT INTO jobs (task, args, idempotency_key)
+        SELECT %(task)s, a, k
+        FROM unnest(%(args)s::jsonb[], %(idempotency_keys)s::text[]) AS t(a, k)
+        ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+        RETURNING id
+    )
+    SELECT id, pg_notify(%(channel)s, '') FROM inserted
+"""
+
 
 def enqueue(
         conn: psycopg.Connection,
@@ -39,16 +64,13 @@ def enqueue(
     # so a bulk fan-out costs one wakeup, not one per job.
     with conn.cursor() as cur:
         cur.execute(
-            """
-            WITH inserted AS (
-                INSERT INTO jobs (task, args, idempotency_key)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
-                RETURNING id
-            )
-            SELECT id, pg_notify(%s, '') FROM inserted
-            """,
-            (task, Jsonb(args), idempotency_key, JOB_NOTIFY_CHANNEL),
+            ENQUEUE_SQL,
+            {
+                "task": task,
+                "args": Jsonb(args),
+                "idempotency_key": idempotency_key,
+                "channel": JOB_NOTIFY_CHANNEL,
+            },
         )
         new_id = cur.fetchone()["id"]
     return new_id
@@ -86,16 +108,13 @@ def enqueue_many(
     # took 126ms this way against 136ms as two statements.
     with conn.cursor() as cur:
         cur.execute(
-            """
-            WITH inserted AS (
-                INSERT INTO jobs (task, args, idempotency_key)
-                SELECT %s, a, k FROM unnest(%s::jsonb[], %s::text[]) AS t(a, k)
-                ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
-                RETURNING id
-            )
-            SELECT id, pg_notify(%s, '') FROM inserted
-            """,
-            (task, [Jsonb(a) for a in args_list], list(idempotency_keys), JOB_NOTIFY_CHANNEL),
+            ENQUEUE_MANY_SQL,
+            {
+                "task": task,
+                "args": [Jsonb(a) for a in args_list],
+                "idempotency_keys": list(idempotency_keys),
+                "channel": JOB_NOTIFY_CHANNEL,
+            },
         )
         ids = [row["id"] for row in cur.fetchall()]
     return ids
